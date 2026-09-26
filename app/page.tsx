@@ -50,7 +50,6 @@ export default function Page() {
     nations,
     toggleMode,
     setRunning,
-    advanceTick,
     selectNation,
     toggleLaw,
     setTaxRate,
@@ -59,14 +58,22 @@ export default function Page() {
     removeTrait,
   } = useGameStore();
 
-  // --- simulation loop: 1 tick per second while running ---
+  // --- simulation loop: 1 tick per second while running -----------------
+  // Reads the action via `useGameStore.getState()` inside the interval
+  // callback rather than closing over the destructured `advanceTick` above.
+  // That decouples the loop from React's render cycle entirely: the
+  // callback always calls whatever the *current* store action is, so there
+  // is no stale closure even across fast-refresh/store re-init, and since
+  // the effect's only dependency is `isRunning`, toggling pause/resume is
+  // the only thing that ever tears down and recreates the interval — ticking
+  // itself never touches this effect, so it can't re-trigger itself.
   useEffect(() => {
     if (!isRunning) return;
     const id = setInterval(() => {
-      advanceTick();
+      useGameStore.getState().advanceTick();
     }, 1000);
     return () => clearInterval(id);
-  }, [isRunning, advanceTick]);
+  }, [isRunning]);
 
   const selectedNation = useMemo(
     () => nations.find((n) => n.id === selectedNationId) ?? nations[0],
@@ -354,11 +361,10 @@ function MarketBoard({ nation }: { nation: Nation }) {
         <tbody className="divide-y divide-slate-800">
           {nation.market.map((g) => {
             const Icon = GOOD_ICON[g.name];
-            const delta = g.price - g.basePrice;
             const deltaColor =
-              delta > 0
+              g.delta > 0
                 ? "text-rose-400"
-                : delta < 0
+                : g.delta < 0
                 ? "text-emerald-400"
                 : "text-slate-500";
             return (
@@ -370,8 +376,8 @@ function MarketBoard({ nation }: { nation: Nation }) {
                 <td className="px-3 py-1.5 font-mono">
                   {g.price.toFixed(2)}{" "}
                   <span className={`text-[10px] ${deltaColor}`}>
-                    ({delta >= 0 ? "+" : ""}
-                    {delta.toFixed(2)})
+                    ({g.delta >= 0 ? "+" : ""}
+                    {g.delta.toFixed(2)})
                   </span>
                 </td>
                 <td className="px-3 py-1.5 font-mono">{Math.round(g.supply)}</td>

@@ -9,6 +9,8 @@ export interface GoodPrice {
   name: GoodName;
   basePrice: number;
   price: number;
+  /** Change in `price` since the previous tick (for trend arrows/coloring). */
+  delta: number;
   supply: number; // units available this tick
   demand: number; // units requested this tick
 }

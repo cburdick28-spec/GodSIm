@@ -15,6 +15,19 @@ const GOOD_BASE_PRICES: Record<GoodName, number> = {
   Luxury: 25,
 };
 
+// Simulation constants — pulled out of `advanceTick` so the formulas below
+// read the same as the spec and are easy to tune in one place.
+const BASE_GROWTH_RATE = 0.0015; // +0.15% per tick, baseline
+const TAX_SOFT_CAP = 25; // % — above this, growth starts tapering off
+const TAX_HARD_CAP = 70; // % — above this, growth is negative (unrest)
+const CONSCRIPTION_GROWTH_MULTIPLIER = 0.5; // halves natural growth
+const TREASURY_TAX_YIELD = 0.05; // gp per (population * taxRate) per tick
+const TARIFF_FLAT_BONUS = 5; // gp/tick while Trade Tariffs is active
+const SUPPLY_JITTER = 3; // supply randomizes by +/- this many units
+const DEMAND_PER_CAPITA = 0.0007; // demand = population * this
+const MIN_PRICE = 1;
+const MAX_PRICE = 100;
+
 function makeMarket(seed: number) {
   return (Object.keys(GOOD_BASE_PRICES) as GoodName[]).map((name) => {
     const basePrice = GOOD_BASE_PRICES[name];
@@ -24,6 +37,7 @@ function makeMarket(seed: number) {
       name,
       basePrice,
       price: basePrice,
+      delta: 0,
       supply,
       demand,
     };
@@ -168,53 +182,79 @@ export const useGameStore = create<GameStore>((set, get) => ({
 
   advanceTick: () => {
     const s = get();
-    let treasuryDelta = 0;
+    let globalRevenue = 0;
 
     const nations = s.nations.map((n) => {
-      // --- market fluctuation: random walk on supply/demand, price follows ---
-      const market = n.market.map((g) => {
-        const supplyShock = (Math.random() - 0.5) * 10;
-        const demandShock = (Math.random() - 0.5) * 10;
-        const supply = Math.max(10, g.supply + supplyShock);
-        const demand = Math.max(10, g.demand + demandShock);
-        const ratio = demand / supply;
-        const price = Math.max(0.5, g.basePrice * ratio);
-        return { ...g, supply, demand, price: Math.round(price * 100) / 100 };
-      });
+      const tariffsActive = n.laws.some(
+        (l) => l.name === "Trade Tariffs" && l.active
+      );
+      const conscriptionActive = n.laws.some(
+        (l) => l.name === "Conscription" && l.active
+      );
 
-      // --- population growth: base rate + trait modifiers, fed by Food surplus ---
-      const food = market.find((g) => g.name === "Food");
-      const foodSurplus = food ? food.supply - food.demand : 0;
-      const foodFactor = foodSurplus >= 0 ? 0.002 : -0.002;
+      // --- 1. Population dynamics -------------------------------------
+      const taxRatePercent = n.taxRate * 100;
+
+      // Linear taper: full +0.15% growth up to the 25% soft cap, falling
+      // to 0% at the 70% hard cap, and continuing negative (unrest) past
+      // it — one straight line covers "slows down" and "starts declining".
+      let growthRate =
+        taxRatePercent <= TAX_SOFT_CAP
+          ? BASE_GROWTH_RATE
+          : BASE_GROWTH_RATE *
+            (1 - (taxRatePercent - TAX_SOFT_CAP) / (TAX_HARD_CAP - TAX_SOFT_CAP));
+
+      if (conscriptionActive) {
+        growthRate *= CONSCRIPTION_GROWTH_MULTIPLIER;
+      }
+
+      // Traits (Blessing/Plague/etc. from God Mode) layer on top of the
+      // natural rate rather than replacing it.
       const traitFactor = n.traits.reduce(
         (sum, t) => sum + t.populationModifier,
         0
       );
-      const growthRate = 0.001 + foodFactor + traitFactor;
+      growthRate += traitFactor;
+
       const population = Math.max(
         0,
         Math.round(n.population * (1 + growthRate))
       );
 
-      // --- tax revenue this tick ---
-      const activeLawModifier = n.laws
-        .filter((l) => l.active)
-        .reduce((sum, l) => sum + l.taxModifier, 0);
-      const effectiveTax = Math.min(1, Math.max(0, n.taxRate + activeLawModifier));
-      const revenue = population * effectiveTax * 0.001;
-      treasuryDelta += revenue;
+      // --- 2. Treasury & tax collection --------------------------------
+      const taxRevenue = population * n.taxRate * TREASURY_TAX_YIELD;
+      const tariffRevenue = tariffsActive ? TARIFF_FLAT_BONUS : 0;
+      const revenue = taxRevenue + tariffRevenue;
+      globalRevenue += revenue;
+      const treasury = n.treasury + revenue;
+
+      // --- 3. Market engine (Endless Sky-style scarcity pricing) -------
+      const market = n.market.map((g) => {
+        const supplyShock = (Math.random() * 2 - 1) * SUPPLY_JITTER; // +/-3
+        const supply = Math.max(0, g.supply + supplyShock);
+        const demand = Math.max(0, Math.round(population * DEMAND_PER_CAPITA));
+
+        const rawPrice = g.basePrice * (demand / Math.max(1, supply));
+        const price = Math.min(
+          MAX_PRICE,
+          Math.max(MIN_PRICE, Math.round(rawPrice * 100) / 100)
+        );
+        const delta = Math.round((price - g.price) * 100) / 100;
+
+        return { ...g, supply, demand, price, delta };
+      });
 
       return {
         ...n,
         population,
+        treasury,
         market,
-        treasury: n.treasury + revenue,
       };
     });
 
     set({
       tick: s.tick + 1,
-      balance: s.balance + treasuryDelta,
+      balance: s.balance + globalRevenue,
       nations,
     });
   },
