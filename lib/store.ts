@@ -28,6 +28,19 @@ const DEMAND_PER_CAPITA = 0.0007; // demand = population * this
 const MIN_PRICE = 1;
 const MAX_PRICE = 100;
 
+// God Mode "Divine Intervention" trait names + their mechanical effects.
+// These are matched by name in `advanceTick` rather than using the generic
+// `populationModifier` field, since each does something structurally
+// different (a growth multiplier, a flat decay, a revenue multiplier)
+// rather than a simple additive nudge.
+export const DIVINE_BLESSING = "Divine Blessing";
+export const BUBONIC_PLAGUE = "Bubonic Plague";
+export const GOLDEN_AGE = "Golden Age";
+
+const DIVINE_BLESSING_GROWTH_MULTIPLIER = 2; // doubles growth speed
+const BUBONIC_PLAGUE_DECAY = 0.95; // -5% population, every tick it's active
+const GOLDEN_AGE_TAX_MULTIPLIER = 2; // doubles tax revenue
+
 function makeMarket(seed: number) {
   return (Object.keys(GOOD_BASE_PRICES) as GoodName[]).map((name) => {
     const basePrice = GOOD_BASE_PRICES[name];
@@ -99,6 +112,8 @@ interface GameStore {
 
   // --- god mode actions ---
   setPopulation: (nationId: string, population: number) => void;
+  adjustPopulation: (nationId: string, delta: number) => void;
+  addTreasury: (nationId: string, amount: number) => void;
   addTrait: (nationId: string, traitName: string, populationModifier: number) => void;
   removeTrait: (nationId: string, traitId: string) => void;
 }
@@ -156,6 +171,24 @@ export const useGameStore = create<GameStore>((set, get) => ({
       ),
     })),
 
+  adjustPopulation: (nationId, delta) =>
+    set((s) => ({
+      nations: s.nations.map((n) =>
+        n.id === nationId
+          ? { ...n, population: Math.max(0, Math.round(n.population + delta)) }
+          : n
+      ),
+    })),
+
+  addTreasury: (nationId, amount) =>
+    set((s) => ({
+      nations: s.nations.map((n) =>
+        n.id === nationId
+          ? { ...n, treasury: Math.max(0, n.treasury + amount) }
+          : n
+      ),
+    })),
+
   addTrait: (nationId, traitName, populationModifier) =>
     set((s) => {
       const trait: Trait = {
@@ -193,36 +226,55 @@ export const useGameStore = create<GameStore>((set, get) => ({
       );
 
       // --- 1. Population dynamics -------------------------------------
+      const hasBlessing = n.traits.some((t) => t.name === DIVINE_BLESSING);
+      const hasPlague = n.traits.some((t) => t.name === BUBONIC_PLAGUE);
+      const hasGoldenAge = n.traits.some((t) => t.name === GOLDEN_AGE);
+
       const taxRatePercent = n.taxRate * 100;
 
       // Linear taper: full +0.15% growth up to the 25% soft cap, falling
       // to 0% at the 70% hard cap, and continuing negative (unrest) past
       // it — one straight line covers "slows down" and "starts declining".
-      let growthRate =
-        taxRatePercent <= TAX_SOFT_CAP
-          ? BASE_GROWTH_RATE
-          : BASE_GROWTH_RATE *
-            (1 - (taxRatePercent - TAX_SOFT_CAP) / (TAX_HARD_CAP - TAX_SOFT_CAP));
+      // Golden Age exempts the city from this unrest/unhappiness penalty
+      // entirely, so it always gets the full base growth rate here.
+      let growthRate = hasGoldenAge
+        ? BASE_GROWTH_RATE
+        : taxRatePercent <= TAX_SOFT_CAP
+        ? BASE_GROWTH_RATE
+        : BASE_GROWTH_RATE *
+          (1 - (taxRatePercent - TAX_SOFT_CAP) / (TAX_HARD_CAP - TAX_SOFT_CAP));
 
       if (conscriptionActive) {
         growthRate *= CONSCRIPTION_GROWTH_MULTIPLIER;
       }
 
-      // Traits (Blessing/Plague/etc. from God Mode) layer on top of the
-      // natural rate rather than replacing it.
+      // Divine Blessing doubles whatever growth speed the city currently has.
+      if (hasBlessing) {
+        growthRate *= DIVINE_BLESSING_GROWTH_MULTIPLIER;
+      }
+
+      // Custom/freeform traits (added via the God Mode text box) still layer
+      // on additively; the three named Divine Intervention traits above
+      // carry populationModifier 0 since their effects are special-cased.
       const traitFactor = n.traits.reduce(
         (sum, t) => sum + t.populationModifier,
         0
       );
       growthRate += traitFactor;
 
-      const population = Math.max(
-        0,
-        Math.round(n.population * (1 + growthRate))
-      );
+      let population = Math.max(0, Math.round(n.population * (1 + growthRate)));
+
+      // Bubonic Plague slashes population by a flat 5% every tick it's
+      // active, on top of (i.e. applied after) ordinary growth.
+      if (hasPlague) {
+        population = Math.max(0, Math.round(population * BUBONIC_PLAGUE_DECAY));
+      }
 
       // --- 2. Treasury & tax collection --------------------------------
-      const taxRevenue = population * n.taxRate * TREASURY_TAX_YIELD;
+      let taxRevenue = population * n.taxRate * TREASURY_TAX_YIELD;
+      if (hasGoldenAge) {
+        taxRevenue *= GOLDEN_AGE_TAX_MULTIPLIER;
+      }
       const tariffRevenue = tariffsActive ? TARIFF_FLAT_BONUS : 0;
       const revenue = taxRevenue + tariffRevenue;
       globalRevenue += revenue;

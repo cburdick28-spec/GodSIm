@@ -20,14 +20,23 @@ import {
   Wheat,
   Hammer,
   Gem,
-  Skull,
   Plus,
   Trash2,
   ChevronUp,
   ChevronDown,
   Minus,
+  Wand2,
+  Landmark,
+  HeartPulse,
+  Biohazard,
+  Star,
 } from "lucide-react";
-import { useGameStore } from "@/lib/store";
+import {
+  useGameStore,
+  DIVINE_BLESSING,
+  BUBONIC_PLAGUE,
+  GOLDEN_AGE,
+} from "@/lib/store";
 import type { GoodName, Nation } from "@/lib/types";
 
 const GOOD_ICON: Record<GoodName, typeof Wheat> = {
@@ -36,11 +45,33 @@ const GOOD_ICON: Record<GoodName, typeof Wheat> = {
   Luxury: Gem,
 };
 
-const PRESET_TRAITS: { name: string; populationModifier: number }[] = [
-  { name: "Blessing", populationModifier: 0.02 },
-  { name: "Plague", populationModifier: -0.04 },
-  { name: "Golden Age", populationModifier: 0.015 },
-  { name: "Famine", populationModifier: -0.02 },
+// The three "Divine Intervention" traits God Mode can inject — each maps to
+// a special-cased mechanic in the simulation store (see lib/store.ts), so
+// unlike a freeform custom trait these carry populationModifier 0 here.
+const DIVINE_TRAITS: {
+  name: string;
+  description: string;
+  icon: typeof Sparkles;
+  iconColor: string;
+}[] = [
+  {
+    name: DIVINE_BLESSING,
+    description: "Doubles population growth speed while active.",
+    icon: HeartPulse,
+    iconColor: "text-emerald-300",
+  },
+  {
+    name: BUBONIC_PLAGUE,
+    description: "Slashes population by 5% every tick it remains active.",
+    icon: Biohazard,
+    iconColor: "text-rose-400",
+  },
+  {
+    name: GOLDEN_AGE,
+    description: "Doubles tax revenue with no unhappiness or migration.",
+    icon: Star,
+    iconColor: "text-amber-300",
+  },
 ];
 
 export default function Page() {
@@ -57,6 +88,8 @@ export default function Page() {
     toggleLaw,
     setTaxRate,
     setPopulation,
+    adjustPopulation,
+    addTreasury,
     addTrait,
     removeTrait,
   } = useGameStore();
@@ -107,6 +140,8 @@ export default function Page() {
           onToggleLaw={toggleLaw}
           onSetTaxRate={setTaxRate}
           onSetPopulation={setPopulation}
+          onAdjustPopulation={adjustPopulation}
+          onAddTreasury={addTreasury}
           onAddTrait={addTrait}
           onRemoveTrait={removeTrait}
         />
@@ -464,6 +499,8 @@ function RightColumn({
   onToggleLaw,
   onSetTaxRate,
   onSetPopulation,
+  onAdjustPopulation,
+  onAddTreasury,
   onAddTrait,
   onRemoveTrait,
 }: {
@@ -472,6 +509,8 @@ function RightColumn({
   onToggleLaw: (nationId: string, lawId: string) => void;
   onSetTaxRate: (nationId: string, rate: number) => void;
   onSetPopulation: (nationId: string, population: number) => void;
+  onAdjustPopulation: (nationId: string, delta: number) => void;
+  onAddTreasury: (nationId: string, amount: number) => void;
   onAddTrait: (nationId: string, traitName: string, populationModifier: number) => void;
   onRemoveTrait: (nationId: string, traitId: string) => void;
 }) {
@@ -483,20 +522,33 @@ function RightColumn({
     );
   }
 
+  // God Mode gets its own dark-slate, fuchsia-tinted shell so it reads as a
+  // structurally different surface from the standard Ruler Mode legislation
+  // panel, not just a re-skinned version of it.
+  const isGod = mode === "god";
+
   return (
-    <section className="rounded-lg border border-slate-800 bg-slate-900 p-4">
-      {mode === "ruler" ? (
+    <section
+      className={`rounded-lg border p-4 transition-colors ${
+        isGod
+          ? "border-fuchsia-500/30 bg-slate-950 shadow-[0_0_0_1px_rgba(217,70,239,0.05)]"
+          : "border-slate-800 bg-slate-900"
+      }`}
+    >
+      {isGod ? (
+        <GodPanel
+          nation={nation}
+          onSetPopulation={onSetPopulation}
+          onAdjustPopulation={onAdjustPopulation}
+          onAddTreasury={onAddTreasury}
+          onAddTrait={onAddTrait}
+          onRemoveTrait={onRemoveTrait}
+        />
+      ) : (
         <RulerPanel
           nation={nation}
           onToggleLaw={onToggleLaw}
           onSetTaxRate={onSetTaxRate}
-        />
-      ) : (
-        <GodPanel
-          nation={nation}
-          onSetPopulation={onSetPopulation}
-          onAddTrait={onAddTrait}
-          onRemoveTrait={onRemoveTrait}
         />
       )}
     </section>
@@ -605,14 +657,28 @@ function TaxSlider({
   );
 }
 
+const POPULATION_QUICK_STEP = 10_000;
+const TREASURY_SPAWN_AMOUNT = 5_000;
+
+/**
+ * WorldBox-inspired "Divine Intervention Toolkit" — the God Mode inspector.
+ * Every control here writes straight into the Zustand store (see
+ * lib/store.ts), so a click is reflected in the master state — and every
+ * subscribed component, including the market board and nation list on the
+ * left — on the very next render.
+ */
 function GodPanel({
   nation,
   onSetPopulation,
+  onAdjustPopulation,
+  onAddTreasury,
   onAddTrait,
   onRemoveTrait,
 }: {
   nation: Nation;
   onSetPopulation: (nationId: string, population: number) => void;
+  onAdjustPopulation: (nationId: string, delta: number) => void;
+  onAddTreasury: (nationId: string, amount: number) => void;
   onAddTrait: (nationId: string, traitName: string, populationModifier: number) => void;
   onRemoveTrait: (nationId: string, traitId: string) => void;
 }) {
@@ -626,21 +692,26 @@ function GodPanel({
     setPopulationInput(String(nation.population));
   }, [nation.id, nation.population]);
 
+  const activeTraitByName = (name: string) =>
+    nation.traits.find((t) => t.name === name);
+
   return (
     <div className="space-y-6">
       <div>
         <h2 className="flex items-center gap-2 text-sm font-semibold text-fuchsia-300">
-          <Sparkles size={16} /> God Mode — {nation.name}
+          <Wand2 size={16} /> Divine Intervention Toolkit — {nation.name}
         </h2>
         <p className="mt-1 text-xs text-slate-500">
-          Directly inspect and edit the simulation state.
+          Reach directly into the simulation. Every change here applies
+          instantly, no confirmation required.
         </p>
       </div>
 
-      <div>
-        <label className="mb-1 block text-xs font-medium text-slate-300">
-          Population (direct edit)
-        </label>
+      {/* --- 1. Population editor ----------------------------------- */}
+      <div className="rounded-md border border-slate-800 bg-slate-900/60 p-3">
+        <h3 className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-400">
+          <Users size={13} /> Population Editor
+        </h3>
         <div className="flex gap-2">
           <input
             type="number"
@@ -658,30 +729,82 @@ function GodPanel({
             Set
           </button>
         </div>
+        <div className="mt-2 flex gap-2">
+          <button
+            onClick={() => onAdjustPopulation(nation.id, POPULATION_QUICK_STEP)}
+            className="flex-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/20"
+          >
+            +10k Pop
+          </button>
+          <button
+            onClick={() => onAdjustPopulation(nation.id, -POPULATION_QUICK_STEP)}
+            className="flex-1 rounded-md border border-rose-500/30 bg-rose-500/10 px-2.5 py-1.5 text-xs font-semibold text-rose-300 hover:bg-rose-500/20"
+          >
+            -10k Pop
+          </button>
+        </div>
       </div>
 
-      <div>
-        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-          Apply Trait
+      {/* --- 2. Treasury spawner -------------------------------------- */}
+      <div className="rounded-md border border-slate-800 bg-slate-900/60 p-3">
+        <h3 className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-400">
+          <Landmark size={13} /> Treasury Spawner
         </h3>
-        <div className="flex flex-wrap gap-2">
-          {PRESET_TRAITS.map((t) => (
-            <button
-              key={t.name}
-              onClick={() => onAddTrait(nation.id, t.name, t.populationModifier)}
-              className="flex items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-2.5 py-1.5 text-xs text-slate-200 hover:border-fuchsia-500/50 hover:bg-slate-700"
-            >
-              {t.name === "Plague" || t.name === "Famine" ? (
-                <Skull size={12} className="text-rose-400" />
-              ) : (
-                <Sparkles size={12} className="text-amber-300" />
-              )}
-              {t.name}
-            </button>
-          ))}
+        <button
+          onClick={() => onAddTreasury(nation.id, TREASURY_SPAWN_AMOUNT)}
+          className="flex w-full items-center justify-center gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-300 hover:bg-amber-500/20"
+        >
+          <Coins size={13} /> Spawn {TREASURY_SPAWN_AMOUNT.toLocaleString()} gp
+        </button>
+      </div>
+
+      {/* --- 3. Trait injection system ---------------------------------- */}
+      <div className="rounded-md border border-slate-800 bg-slate-900/60 p-3">
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+          Trait Injection System
+        </h3>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+          {DIVINE_TRAITS.map((t) => {
+            const Icon = t.icon;
+            const activeTrait = activeTraitByName(t.name);
+            const isActive = Boolean(activeTrait);
+            return (
+              <button
+                key={t.name}
+                title={t.description}
+                onClick={() =>
+                  isActive && activeTrait
+                    ? onRemoveTrait(nation.id, activeTrait.id)
+                    : onAddTrait(nation.id, t.name, 0)
+                }
+                className={`flex flex-col items-start gap-1 rounded-md border px-2.5 py-2 text-left text-xs transition-colors ${
+                  isActive
+                    ? "border-fuchsia-500/50 bg-fuchsia-500/10 text-fuchsia-200"
+                    : "border-slate-700 bg-slate-800 text-slate-200 hover:border-fuchsia-500/40 hover:bg-slate-700"
+                }`}
+              >
+                <span className="flex items-center gap-1.5 font-semibold">
+                  <Icon size={13} className={t.iconColor} />
+                  {t.name}
+                </span>
+                <span className="text-[10px] leading-snug text-slate-500">
+                  {t.description}
+                </span>
+                <span
+                  className={`mt-1 rounded-full px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide ${
+                    isActive
+                      ? "bg-fuchsia-500/20 text-fuchsia-300"
+                      : "bg-slate-700 text-slate-400"
+                  }`}
+                >
+                  {isActive ? "Active — click to lift" : "Inactive"}
+                </span>
+              </button>
+            );
+          })}
         </div>
 
-        <div className="mt-2 flex gap-2">
+        <div className="mt-3 flex gap-2">
           <input
             type="text"
             value={customTrait}
