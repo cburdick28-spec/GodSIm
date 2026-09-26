@@ -1,204 +1,223 @@
 // lib/simulation/useSimulationEngine.ts
 //
-// React hook wrapper around the pure `simulationTick` reducer. Mirrors the
-// pattern used by the Zustand store in lib/store.ts: a single interval
-// drives one dispatch per tick, and every God Mode / Ruler Mode action is a
-// small, type-safe reducer case rather than ad hoc setState calls scattered
-// through components — so components stay simple, and every state change
-// (scripted or from a tick) flows through the same, testable reducer.
+// React hook wrapper around the ported SimGod engine (engine.ts). The
+// source is a Streamlit app: time only advances when the person clicks
+// "1h" / "6h" / "24h" / "Run Nh", there's no autoplay. This hook preserves
+// that as the default (advanceHours is just a dispatch, called on demand)
+// but also supports optional autoplay via `autoTickMs`, using the same
+// stale-closure-safe pattern as the rest of this dashboard: the tick
+// interval's only effect dependency is `isRunning`, and every dispatcher
+// is a stable `useCallback` wrapping the reducer's stable `dispatch`.
 
 import { useCallback, useEffect, useReducer, useState } from "react";
-import { clamp, createInitialWorldState, simulationTick } from "./engine";
-import type { Person, WorldState } from "./types";
-
-// --- action types -----------------------------------------------------
+import {
+  advanceHours,
+  godAdvanceAge,
+  godBless,
+  godConvert,
+  godFertilityBoom,
+  godMakePeace,
+  godPlague,
+  godRainWealth,
+  godResurrect,
+  godSmite,
+  godSpawnNation,
+  godStartWar,
+  godTerraform,
+  seedWorld,
+} from "./engine";
+import type { WorldState } from "./types";
 
 type EngineAction =
-  | { type: "TICK" }
-  | { type: "SET_PERSON_FIELD"; personId: number; patch: Partial<Person> }
-  | { type: "ADD_TRAIT_TO_PERSON"; personId: number; trait: string }
-  | { type: "REMOVE_TRAIT_FROM_PERSON"; personId: number; trait: string }
-  /** WorldBox-style global sandbox effect: apply a trait to every living
-   * person at once (e.g. a world-spanning Plague or Blessing). */
-  | { type: "ADD_TRAIT_TO_ALL_LIVING"; trait: string }
-  | { type: "SET_NATION_TAX_RATE"; nationId: number; rate: number }
-  | { type: "ADD_TREASURY"; nationId: number; amount: number }
-  | {
-      type: "SET_TAX_THRESHOLDS";
-      softCapPercent: number;
-      hardCapPercent: number;
-    };
+  | { type: "ADVANCE_HOURS"; hours: number }
+  | { type: "BLESS"; personId: number; amount?: number }
+  | { type: "SMITE"; personId: number }
+  | { type: "PLAGUE"; nationId: number }
+  | { type: "FERTILITY_BOOM"; nationId: number }
+  | { type: "TERRAFORM"; kind: string; x: number; y: number }
+  | { type: "CONVERT"; nationId: number; religion: string }
+  | { type: "RAIN_WEALTH"; nationId: number; amount?: number }
+  | { type: "START_WAR"; aId: number; bId: number }
+  | { type: "MAKE_PEACE" }
+  | { type: "RESURRECT"; personId: number }
+  | { type: "ADVANCE_AGE" }
+  | { type: "SPAWN_NATION"; name: string }
+  | { type: "NEW_WORLD" };
 
-function withTrait(traits: string[], trait: string): string[] {
-  return traits.includes(trait) ? traits : [...traits, trait];
+interface EngineState {
+  world: WorldState;
+  /** Last god-power result message — mirrors the source's st.session_state
+   * "flash" messages (success/error/warning banners after an action). */
+  lastMessage: string | null;
 }
 
-function worldReducer(state: WorldState, action: EngineAction): WorldState {
+function reducer(state: EngineState, action: EngineAction): EngineState {
   switch (action.type) {
-    case "TICK":
-      return simulationTick(state);
-
-    case "SET_PERSON_FIELD":
-      return {
-        ...state,
-        people: state.people.map((p) =>
-          p.id === action.personId ? { ...p, ...action.patch } : p
-        ),
-      };
-
-    case "ADD_TRAIT_TO_PERSON":
-      return {
-        ...state,
-        people: state.people.map((p) =>
-          p.id === action.personId
-            ? { ...p, traits: withTrait(p.traits, action.trait) }
-            : p
-        ),
-      };
-
-    case "REMOVE_TRAIT_FROM_PERSON":
-      return {
-        ...state,
-        people: state.people.map((p) =>
-          p.id === action.personId
-            ? { ...p, traits: p.traits.filter((t) => t !== action.trait) }
-            : p
-        ),
-      };
-
-    case "ADD_TRAIT_TO_ALL_LIVING":
-      return {
-        ...state,
-        people: state.people.map((p) =>
-          p.alive ? { ...p, traits: withTrait(p.traits, action.trait) } : p
-        ),
-      };
-
-    case "SET_NATION_TAX_RATE":
-      return {
-        ...state,
-        nations: state.nations.map((n) =>
-          n.id === action.nationId
-            ? { ...n, taxRate: clamp(action.rate, 0, 1) }
-            : n
-        ),
-      };
-
-    case "ADD_TREASURY":
-      return {
-        ...state,
-        nations: state.nations.map((n) =>
-          n.id === action.nationId
-            ? { ...n, treasury: Math.max(0, n.treasury + action.amount) }
-            : n
-        ),
-      };
-
-    case "SET_TAX_THRESHOLDS":
-      return {
-        ...state,
-        settings: {
-          ...state.settings,
-          taxSoftCapPercent: action.softCapPercent,
-          taxHardCapPercent: action.hardCapPercent,
-        },
-      };
-
+    case "ADVANCE_HOURS":
+      return { world: advanceHours(state.world, action.hours), lastMessage: state.lastMessage };
+    case "BLESS": {
+      const { world, message } = godBless(state.world, action.personId, action.amount);
+      return { world, lastMessage: message };
+    }
+    case "SMITE": {
+      const { world, message } = godSmite(state.world, action.personId);
+      return { world, lastMessage: message };
+    }
+    case "PLAGUE": {
+      const { world, message } = godPlague(state.world, action.nationId);
+      return { world, lastMessage: message };
+    }
+    case "FERTILITY_BOOM": {
+      const { world, message } = godFertilityBoom(state.world, action.nationId);
+      return { world, lastMessage: message };
+    }
+    case "TERRAFORM": {
+      const { world, message } = godTerraform(state.world, action.kind, action.x, action.y);
+      return { world, lastMessage: message };
+    }
+    case "CONVERT": {
+      const { world, message } = godConvert(state.world, action.nationId, action.religion);
+      return { world, lastMessage: message };
+    }
+    case "RAIN_WEALTH": {
+      const { world, message } = godRainWealth(state.world, action.nationId, action.amount);
+      return { world, lastMessage: message };
+    }
+    case "START_WAR": {
+      const { world, message } = godStartWar(state.world, action.aId, action.bId);
+      return { world, lastMessage: message };
+    }
+    case "MAKE_PEACE": {
+      const { world, message } = godMakePeace(state.world);
+      return { world, lastMessage: message };
+    }
+    case "RESURRECT": {
+      const { world, message } = godResurrect(state.world, action.personId);
+      return { world, lastMessage: message };
+    }
+    case "ADVANCE_AGE": {
+      const { world, message } = godAdvanceAge(state.world);
+      return { world, lastMessage: message };
+    }
+    case "SPAWN_NATION": {
+      const { world, message } = godSpawnNation(state.world, action.name);
+      return { world, lastMessage: message };
+    }
+    case "NEW_WORLD":
+      return { world: seedWorld(), lastMessage: "A new world breathes its first." };
     default:
       return state;
   }
 }
 
+export interface UseSimulationEngineOptions {
+  /** If set, auto-advances one hour every `autoTickMs` while `isRunning` is
+   * true. Left unset by default to match the source's manual, button-driven
+   * time controls — pass e.g. 1000 for continuous real-time ticking. */
+  autoTickMs?: number;
+}
+
 export interface UseSimulationEngineResult {
   world: WorldState;
+  lastMessage: string | null;
   isRunning: boolean;
   setRunning: (running: boolean) => void;
 
-  // --- God Mode / Ruler Mode dispatch surface ---------------------------
-  setPersonField: (personId: number, patch: Partial<Person>) => void;
-  addTraitToPerson: (personId: number, trait: string) => void;
-  removeTraitFromPerson: (personId: number, trait: string) => void;
-  addTraitToAllLiving: (trait: string) => void;
-  setNationTaxRate: (nationId: number, rate: number) => void;
-  addTreasury: (nationId: number, amount: number) => void;
-  setTaxThresholds: (softCapPercent: number, hardCapPercent: number) => void;
+  // --- time controls ("▶ 1h" / "▶▶ 6h" / "▶▶▶ 24h" / "Run Nh") -----------
+  advanceHours: (hours: number) => void;
+
+  // --- the 12 god powers --------------------------------------------------
+  bless: (personId: number, amount?: number) => void;
+  smite: (personId: number) => void;
+  plague: (nationId: number) => void;
+  fertilityBoom: (nationId: number) => void;
+  terraform: (kind: string, x: number, y: number) => void;
+  convert: (nationId: number, religion: string) => void;
+  rainWealth: (nationId: number, amount?: number) => void;
+  startWar: (aId: number, bId: number) => void;
+  makePeace: () => void;
+  resurrect: (personId: number) => void;
+  advanceAge: () => void;
+  spawnNation: (name: string) => void;
+
+  // --- session control ("🔄 New World") -----------------------------------
+  newWorld: () => void;
 }
 
-/**
- * Drives the world-simulation engine: one `simulationTick` per interval
- * while `isRunning` is true, plus a stable set of dispatchers for direct
- * sandbox edits. Every dispatcher is wrapped in `useCallback` with an empty
- * dependency array — `dispatch` from `useReducer` is referentially stable
- * for the lifetime of the component, so none of these ever go stale and
- * none of them need to appear in the tick effect's dependency array.
- */
 export function useSimulationEngine(
-  tickIntervalMs = 1000
+  options: UseSimulationEngineOptions = {}
 ): UseSimulationEngineResult {
-  const [world, dispatch] = useReducer(worldReducer, undefined, createInitialWorldState);
-  const [isRunning, setIsRunning] = useState(true);
+  const { autoTickMs } = options;
+  const [state, dispatch] = useReducer(reducer, undefined, () => ({
+    world: seedWorld(),
+    lastMessage: null,
+  }));
+  const [isRunning, setIsRunning] = useState(false);
 
-  // Same pattern as app/page.tsx's nation tick loop: the effect's only
-  // dependency is `isRunning`, so pause/resume is the only thing that ever
-  // tears down and recreates the interval. Ticking dispatches an action but
-  // never touches `isRunning`, so it can't retrigger this effect itself.
+  // Optional autoplay. `dispatch` is stable, so the effect's only real
+  // dependency is `isRunning` (and `autoTickMs`, which is expected to be a
+  // constant passed once) — ticking dispatches an action but never touches
+  // either, so it can never retrigger this effect itself.
   useEffect(() => {
-    if (!isRunning) return;
-    const id = setInterval(() => dispatch({ type: "TICK" }), tickIntervalMs);
+    if (!isRunning || !autoTickMs) return;
+    const id = setInterval(() => dispatch({ type: "ADVANCE_HOURS", hours: 1 }), autoTickMs);
     return () => clearInterval(id);
-  }, [isRunning, tickIntervalMs]);
+  }, [isRunning, autoTickMs]);
 
-  const setPersonField = useCallback(
-    (personId: number, patch: Partial<Person>) =>
-      dispatch({ type: "SET_PERSON_FIELD", personId, patch }),
+  const advanceHoursAction = useCallback(
+    (hours: number) => dispatch({ type: "ADVANCE_HOURS", hours }),
     []
   );
-
-  const addTraitToPerson = useCallback(
-    (personId: number, trait: string) =>
-      dispatch({ type: "ADD_TRAIT_TO_PERSON", personId, trait }),
+  const bless = useCallback(
+    (personId: number, amount?: number) => dispatch({ type: "BLESS", personId, amount }),
     []
   );
-
-  const removeTraitFromPerson = useCallback(
-    (personId: number, trait: string) =>
-      dispatch({ type: "REMOVE_TRAIT_FROM_PERSON", personId, trait }),
+  const smite = useCallback((personId: number) => dispatch({ type: "SMITE", personId }), []);
+  const plague = useCallback((nationId: number) => dispatch({ type: "PLAGUE", nationId }), []);
+  const fertilityBoom = useCallback(
+    (nationId: number) => dispatch({ type: "FERTILITY_BOOM", nationId }),
     []
   );
-
-  const addTraitToAllLiving = useCallback(
-    (trait: string) => dispatch({ type: "ADD_TRAIT_TO_ALL_LIVING", trait }),
+  const terraform = useCallback(
+    (kind: string, x: number, y: number) => dispatch({ type: "TERRAFORM", kind, x, y }),
     []
   );
-
-  const setNationTaxRate = useCallback(
-    (nationId: number, rate: number) =>
-      dispatch({ type: "SET_NATION_TAX_RATE", nationId, rate }),
+  const convert = useCallback(
+    (nationId: number, religion: string) => dispatch({ type: "CONVERT", nationId, religion }),
     []
   );
-
-  const addTreasury = useCallback(
-    (nationId: number, amount: number) =>
-      dispatch({ type: "ADD_TREASURY", nationId, amount }),
+  const rainWealth = useCallback(
+    (nationId: number, amount?: number) => dispatch({ type: "RAIN_WEALTH", nationId, amount }),
     []
   );
-
-  const setTaxThresholds = useCallback(
-    (softCapPercent: number, hardCapPercent: number) =>
-      dispatch({ type: "SET_TAX_THRESHOLDS", softCapPercent, hardCapPercent }),
+  const startWar = useCallback(
+    (aId: number, bId: number) => dispatch({ type: "START_WAR", aId, bId }),
     []
   );
+  const makePeace = useCallback(() => dispatch({ type: "MAKE_PEACE" }), []);
+  const resurrect = useCallback((personId: number) => dispatch({ type: "RESURRECT", personId }), []);
+  const advanceAge = useCallback(() => dispatch({ type: "ADVANCE_AGE" }), []);
+  const spawnNation = useCallback((name: string) => dispatch({ type: "SPAWN_NATION", name }), []);
+  const newWorld = useCallback(() => dispatch({ type: "NEW_WORLD" }), []);
 
   return {
-    world,
+    world: state.world,
+    lastMessage: state.lastMessage,
     isRunning,
     setRunning: setIsRunning,
-    setPersonField,
-    addTraitToPerson,
-    removeTraitFromPerson,
-    addTraitToAllLiving,
-    setNationTaxRate,
-    addTreasury,
-    setTaxThresholds,
+    advanceHours: advanceHoursAction,
+    bless,
+    smite,
+    plague,
+    fertilityBoom,
+    terraform,
+    convert,
+    rainWealth,
+    startWar,
+    makePeace,
+    resurrect,
+    advanceAge,
+    spawnNation,
+    newWorld,
   };
 }

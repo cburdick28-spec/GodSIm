@@ -1,71 +1,87 @@
 // lib/simulation/types.ts
 //
-// Fully-typed shape of the deeper WorldBox/Civ-style simulation layer
-// (people, buildings, nations, ages) — translated from the Python
-// prototype's data model into TypeScript. This sits alongside, and is
-// designed to eventually feed, the simpler Nation/Market model in
-// lib/store.ts and lib/types.ts.
+// Direct TypeScript port of SimGod's data model (originally Python
+// dataclasses). snake_case -> camelCase, Optional[X] -> X | null,
+// dataclass field(default_factory=...) -> plain typed properties.
+//
+// Deliberately NOT ported: World.terrain (procedural terrain generation is
+// a separate concern from the simulation's state shape) and anything
+// Plotly/Streamlit-specific (those are that script's rendering layer; this
+// dashboard renders the same WorldState with React/Tailwind instead).
 
 export type Season = "Spring" | "Summer" | "Autumn" | "Winter";
 
-export type Weather = "Clear" | "Rain" | "Storm" | "Snow" | "Drought";
+export type Weather =
+  | "Clear"
+  | "Sunny"
+  | "Cloudy"
+  | "Rainy"
+  | "Windy"
+  | "Stormy"
+  | "Snowy"
+  | "Foggy";
 
-/** A tradeable market resource. "Wealth" is handled separately (it flows
- * straight into treasuries rather than being bought/sold), so it is not a
- * MarketGood name. */
-export type ResourceName = "Food" | "Iron" | "Luxury";
+export type Sex = "M" | "F";
 
-export type Sex = "male" | "female";
-
+/** Free-text in the original (whatever `act()` last set it to), typed here
+ * as the specific values the engine actually produces. */
 export type PersonState =
   | "idle"
-  | "working"
-  | "sleeping"
-  | "socializing"
-  | "fleeing"
-  | "deceased";
+  | "alone"
+  | "foraging"
+  | "sleeping rough"
+  | "washing up"
+  | "playing"
+  | "whispering a prayer"
+  | `eating at ${string}`
+  | `resting at home`
+  | `enjoying the ${string}`
+  | `talking with ${string}`
+  | `praying`
+  | `working as ${string}`
+  | "touched by the divine"
+  | "struck down"
+  | "claimed by plague"
+  | "collapsed"
+  | "passed away"
+  | "returned from death";
 
-// --- Content matrices (definitions, not runtime instances) --------------
+// --- content-table row shapes ------------------------------------------
 
 export interface AgeDefinition {
   name: string;
-  /** Minimum average national tech score required to enter this age. */
-  techRequired: number;
-  /** Minimum living world population required to enter this age. */
-  popRequired: number;
+  minPopulation: number;
+  minTech: number;
+  description: string;
 }
 
 export interface ReligionDefinition {
   name: string;
-  /** How many devotion points a believer loses per day without practice. */
-  devotionDecayPerDay: number;
+  description: string;
 }
 
+/** One row of the JOBS table. `moodBonus` and `produces` are carried over
+ * from the source for fidelity but — same as in the original script —
+ * aren't yet consumed anywhere in the tick loop; they're metadata for a
+ * future economic pass. */
 export interface JobDefinition {
-  name: string;
-  /** Market resource this job produces, if any (Merchants produce none). */
-  resource?: ResourceName;
-  /** Units of `resource` generated per active worker, per tick. */
-  outputPerWorker: number;
-  /** Gold pieces generated per active worker, per tick, paid to their nation's treasury. */
-  wealthPerWorker: number;
+  title: string;
+  minAge: number;
+  wage: number;
+  moodBonus: number;
+  produces: string | null;
 }
 
 export interface BuildingKindDefinition {
-  name: string;
-  /** Resource cost to construct one of this building. */
-  cost: Partial<Record<ResourceName, number>>;
-  /** How many people this building can house/employ (0 = not a housing/work building). */
+  cost: number;
   capacity: number;
 }
 
-// --- Runtime entities -----------------------------------------------------
+// --- runtime entities -----------------------------------------------------
 
 export interface Belief {
   religion: string | null;
-  /** 0-100: how devout this person currently is. */
-  devotion: number;
-  /** True once devotion has decayed low enough that the person is wavering. */
+  devotion: number; // 0-100
   doubting: boolean;
 }
 
@@ -75,25 +91,31 @@ export interface Person {
   age: number;
   sex: Sex;
   alive: boolean;
-  /** 0-100 */
-  energy: number;
-  /** 0-100, 0 = starving to death */
-  hunger: number;
-  /** 0-100 */
-  social: number;
-  /** 0-100, derived each tick from energy/hunger/social */
-  mood: number;
-  job: string | null;
-  wealth: number;
+  energy: number; // 0-100
+  hunger: number; // 0-100
+  fun: number; // 0-100
+  hygiene: number; // 0-100
+  social: number; // 0-100
+  mood: number; // 0-100
   traits: string[];
+  job: string;
+  wage: number;
+  wealth: number;
   belief: Belief;
+  loyalty: number; // 0-100
+  anger: number; // 0-100
+  ambition: number; // 0-100
   /** personId -> affinity, -100..100 */
   relationships: Record<number, number>;
+  partnerId: number | null;
+  childrenIds: number[];
+  parentIds: number[];
+  x: number;
+  y: number;
+  nationId: number | null;
   state: PersonState;
-  /** 0-100: how much this person reveres the player-god */
-  godLove: number;
-  /** 0-100: how much this person fears the player-god */
-  godFear: number;
+  godLove: number; // 0-100
+  godFear: number; // 0-100
 }
 
 export interface Building {
@@ -102,7 +124,9 @@ export interface Building {
   kind: string;
   x: number;
   y: number;
+  nationId: number | null;
   hp: number;
+  builtDay: number;
 }
 
 export interface Nation {
@@ -111,13 +135,14 @@ export interface Nation {
   color: string;
   capital: [number, number];
   faith: string | null;
+  culture: number;
+  military: number;
   treasury: number;
   tech: number;
-  /** 0-100 */
-  stability: number;
-  /** 0..1 fraction, same convention as lib/store.ts */
-  taxRate: number;
+  stability: number; // 0-100
   atWarWith: number[];
+  holidays: string[];
+  foundedDay: number;
   motto: string;
 }
 
@@ -126,49 +151,38 @@ export interface EventLog {
   hour: number;
   kind: string;
   text: string;
+  nationId?: number | null;
+  personId?: number | null;
 }
 
-export interface MarketGood {
-  name: ResourceName;
-  basePrice: number;
-  price: number;
-  /** Change in `price` since the previous tick. */
-  delta: number;
-  supply: number;
-  demand: number;
-}
-
-/** One row of the world-history time series, for charting. */
+/** One row of the world-history time series (World.record_history). */
 export interface HistorySnapshot {
   day: number;
-  hour: number;
-  totalPopulation: number;
+  population: number;
   averageMood: number;
-  activeNations: number;
-}
-
-/** Tunable knobs God Mode / Ruler Mode can alter at runtime. */
-export interface SimulationSettings {
-  /** % tax rate above which population growth starts tapering off. */
-  taxSoftCapPercent: number;
-  /** % tax rate above which population growth goes negative (unrest). */
-  taxHardCapPercent: number;
-  /** Baseline per-tick population growth rate (e.g. 0.0015 = +0.15%). */
-  baseGrowthRate: number;
+  buildings: number;
+  nations: number;
+  age: string;
 }
 
 export interface WorldState {
+  name: string;
   day: number;
   hour: number;
-  season: Season;
   weather: Weather;
-  /** Name of the current AgeDefinition. */
-  age: string;
-  settings: SimulationSettings;
+  season: Season;
+  ageIndex: number;
   people: Person[];
   buildings: Building[];
   nations: Nation[];
-  market: MarketGood[];
   events: EventLog[];
+  nextPersonId: number;
+  nextBuildingId: number;
+  nextNationId: number;
+  miraclesPerformed: number;
+  smites: number;
+  births: number;
+  deaths: number;
+  warsFought: number;
   history: HistorySnapshot[];
 }
