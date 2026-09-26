@@ -23,6 +23,9 @@ import {
   Skull,
   Plus,
   Trash2,
+  ChevronUp,
+  ChevronDown,
+  Minus,
 } from "lucide-react";
 import { useGameStore } from "@/lib/store";
 import type { GoodName, Nation } from "@/lib/types";
@@ -349,7 +352,7 @@ function MarketBoard({ nation }: { nation: Nation }) {
       <h3 className="border-b border-slate-800 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
         Market Board
       </h3>
-      <table className="w-full text-xs">
+      <table className="w-full border-collapse text-xs">
         <thead>
           <tr className="text-left text-slate-500">
             <th className="px-3 py-1.5 font-medium">Good</th>
@@ -361,33 +364,93 @@ function MarketBoard({ nation }: { nation: Nation }) {
         <tbody className="divide-y divide-slate-800">
           {nation.market.map((g) => {
             const Icon = GOOD_ICON[g.name];
-            const deltaColor =
-              g.delta > 0
-                ? "text-rose-400"
-                : g.delta < 0
-                ? "text-emerald-400"
-                : "text-slate-500";
             return (
               <tr key={g.name} className="text-slate-300">
-                <td className="flex items-center gap-1.5 px-3 py-1.5">
-                  <Icon size={13} className="text-slate-500" />
-                  {g.name}
-                </td>
-                <td className="px-3 py-1.5 font-mono">
-                  {g.price.toFixed(2)}{" "}
-                  <span className={`text-[10px] ${deltaColor}`}>
-                    ({g.delta >= 0 ? "+" : ""}
-                    {g.delta.toFixed(2)})
+                <td className="px-3 py-2">
+                  <span className="flex items-center gap-1.5">
+                    <Icon size={13} className="text-slate-500" />
+                    {g.name}
                   </span>
                 </td>
-                <td className="px-3 py-1.5 font-mono">{Math.round(g.supply)}</td>
-                <td className="px-3 py-1.5 font-mono">{Math.round(g.demand)}</td>
+                <td className="px-3 py-2">
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-mono tabular-nums text-slate-100">
+                      {g.price.toFixed(2)}
+                    </span>
+                    <PriceDelta delta={g.delta} />
+                  </div>
+                </td>
+                <td className="px-3 py-2">
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-mono tabular-nums">
+                      {Math.round(g.supply)}
+                    </span>
+                    <SupplyStatusBadge supply={g.supply} demand={g.demand} />
+                  </div>
+                </td>
+                <td className="px-3 py-2 font-mono tabular-nums">
+                  {Math.round(g.demand)}
+                </td>
               </tr>
             );
           })}
         </tbody>
       </table>
     </div>
+  );
+}
+
+/** Price-trend "flasher": colored delta text with a direction chevron. */
+function PriceDelta({ delta }: { delta: number }) {
+  if (delta > 0) {
+    return (
+      <span className="flex items-center gap-0.5 font-mono text-[11px] font-semibold text-emerald-400">
+        <ChevronUp size={12} strokeWidth={3} />+{delta.toFixed(2)}
+      </span>
+    );
+  }
+  if (delta < 0) {
+    return (
+      <span className="flex items-center gap-0.5 font-mono text-[11px] font-semibold text-red-400">
+        <ChevronDown size={12} strokeWidth={3} />
+        {delta.toFixed(2)}
+      </span>
+    );
+  }
+  return (
+    <span className="flex items-center gap-0.5 font-mono text-[11px] text-slate-600">
+      <Minus size={12} strokeWidth={3} />
+      0.00
+    </span>
+  );
+}
+
+/** Supply-vs-demand status badge shown next to the raw Supply figure. */
+function SupplyStatusBadge({
+  supply,
+  demand,
+}: {
+  supply: number;
+  demand: number;
+}) {
+  if (supply >= demand * 1.2) {
+    return (
+      <span className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-emerald-400">
+        Abundant
+      </span>
+    );
+  }
+  if (supply < demand) {
+    return (
+      <span className="rounded-full bg-red-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-red-400">
+        Deficit
+      </span>
+    );
+  }
+  return (
+    <span className="rounded-full bg-slate-700/60 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-slate-400">
+      Stable
+    </span>
   );
 }
 
@@ -460,22 +523,10 @@ function RulerPanel({
         </p>
       </div>
 
-      <div>
-        <label className="mb-1 flex items-center justify-between text-xs font-medium text-slate-300">
-          <span>Tax Rate</span>
-          <span className="font-mono text-amber-300">
-            {Math.round(nation.taxRate * 100)}%
-          </span>
-        </label>
-        <input
-          type="range"
-          min={0}
-          max={100}
-          value={Math.round(nation.taxRate * 100)}
-          onChange={(e) => onSetTaxRate(nation.id, Number(e.target.value) / 100)}
-          className="w-full accent-amber-500"
-        />
-      </div>
+      <TaxSlider
+        percent={Math.round(nation.taxRate * 100)}
+        onChange={(percent) => onSetTaxRate(nation.id, percent / 100)}
+      />
 
       <div>
         <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
@@ -504,6 +555,51 @@ function RulerPanel({
             </li>
           ))}
         </ul>
+      </div>
+    </div>
+  );
+}
+
+/** Taxation Rate control: bold label left, badge right, slider below. */
+function TaxSlider({
+  percent,
+  onChange,
+}: {
+  percent: number;
+  onChange: (percent: number) => void;
+}) {
+  const zone =
+    percent > 70
+      ? { label: "text-red-300", badge: "border-red-500/40 bg-red-500/10 text-red-300" }
+      : percent > 25
+      ? { label: "text-amber-300", badge: "border-amber-500/40 bg-amber-500/10 text-amber-300" }
+      : { label: "text-emerald-300", badge: "border-emerald-500/40 bg-emerald-500/10 text-emerald-300" };
+
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-sm font-bold text-slate-100">Taxation Rate</span>
+        <span
+          className={`rounded-full border px-2.5 py-0.5 font-mono text-xs font-semibold tabular-nums transition-colors ${zone.badge}`}
+        >
+          {percent}%
+        </span>
+      </div>
+
+      <input
+        type="range"
+        min={0}
+        max={100}
+        value={percent}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="w-full accent-amber-500"
+      />
+
+      <div className="mt-1 flex justify-between text-[10px] text-slate-600">
+        <span>0%</span>
+        <span className={percent > 25 ? zone.label : undefined}>25% soft cap</span>
+        <span className={percent > 70 ? zone.label : undefined}>70% unrest</span>
+        <span>100%</span>
       </div>
     </div>
   );
