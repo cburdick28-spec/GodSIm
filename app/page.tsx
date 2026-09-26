@@ -10,8 +10,10 @@
 //   Left   — scrollable inhabitant list (level gauge, job badge, needs %)
 //            with a click-to-open inspector modal (wealth + traits; God
 //            Mode adds per-citizen trait injection buttons there).
-//   Middle — active Cosmic Age card (narrative), an active-crises strip,
-//            and a live scrolling event log.
+//   Middle — a WorldBox-style world map (terrain grid + nation territory +
+//            capital markers, paintable with a terrain brush in God Mode),
+//            the active Cosmic Age card (narrative), an active-crises
+//            strip, and a live scrolling event log.
 //   Right  — commodity exchange board (treasury, price, delta, scarcity
 //            badge, military might) per nation, plus a Nation Control
 //            Panel that swaps between Ruler Mode legislation and the God
@@ -43,6 +45,8 @@ import {
   HeartPulse,
   Biohazard,
   ShieldPlus,
+  Map as MapIcon,
+  Paintbrush,
 } from "lucide-react";
 import {
   useSimulationEngine,
@@ -52,6 +56,10 @@ import {
   CRISIS_LABEL,
   DIVINE_BLESSING_TRAIT,
   BUBONIC_PLAGUE_TRAIT,
+  computeTerritory,
+  TERRAIN_CYCLE,
+  MAP_WIDTH,
+  MAP_HEIGHT,
   type Person,
   type Nation,
   type EventLog,
@@ -59,7 +67,18 @@ import {
   type GoodName,
   type Law,
   type LawId,
+  type Tile,
+  type TerrainType,
+  type WorldState,
 } from "@/lib/simulationEngine";
+
+const TERRAIN_COLOR: Record<TerrainType, string> = {
+  Water: "#1e40af",
+  Plains: "#4d7c0f",
+  Forest: "#166534",
+  Mountain: "#57534e",
+  Desert: "#b45309",
+};
 
 const JOB_BADGE: Record<JobClass, string> = {
   Farmer: "border-emerald-500/40 bg-emerald-500/10 text-emerald-300",
@@ -100,11 +119,13 @@ export default function Page() {
     addTreasuryAction,
     togglePersonTraitAction,
     toggleLawAction,
+    paintTerrainAction,
   } = useSimulationEngine();
 
   const [mode, setMode] = useState<Mode>("ruler");
   const [selectedNationId, setSelectedNationId] = useState<number>(world.nations[0]?.id ?? 1);
   const [inspectedPersonId, setInspectedPersonId] = useState<number | null>(null);
+  const [terrainBrush, setTerrainBrush] = useState<TerrainType>("Forest");
 
   const cosmicAge = useMemo(() => getCosmicAge(world.day), [world.day]);
 
@@ -145,11 +166,16 @@ export default function Page() {
         <LeftColumn people={world.people} onInspect={setInspectedPersonId} />
 
         <MiddleColumn
+          world={world}
           cosmicAge={cosmicAge}
           day={world.day}
           livingPopulation={livingPopulation}
           activeCrises={activeCrises}
           eventLog={world.eventLog}
+          mode={mode}
+          terrainBrush={terrainBrush}
+          onSetTerrainBrush={setTerrainBrush}
+          onPaintTile={paintTerrainAction}
         />
 
         <RightColumn
@@ -458,22 +484,40 @@ function PersonInspectorModal({
 /* ------------------------------------------------------------------ */
 
 function MiddleColumn({
+  world,
   cosmicAge,
   day,
   livingPopulation,
   activeCrises,
   eventLog,
+  mode,
+  terrainBrush,
+  onSetTerrainBrush,
+  onPaintTile,
 }: {
+  world: WorldState;
   cosmicAge: ReturnType<typeof getCosmicAge>;
   day: number;
   livingPopulation: number;
   activeCrises: Nation[];
   eventLog: EventLog[];
+  mode: Mode;
+  terrainBrush: TerrainType;
+  onSetTerrainBrush: (t: TerrainType) => void;
+  onPaintTile: (x: number, y: number, terrain: TerrainType) => void;
 }) {
   const recentEvents = useMemo(() => eventLog.slice(-60).reverse(), [eventLog]);
 
   return (
     <section className="flex flex-col gap-4">
+      <WorldMap
+        world={world}
+        mode={mode}
+        terrainBrush={terrainBrush}
+        onSetTerrainBrush={onSetTerrainBrush}
+        onPaintTile={onPaintTile}
+      />
+
       <div className="rounded-lg border border-white/10 bg-white/5 p-4">
         <div className="mb-1 flex items-center gap-2">
           <Sparkles size={16} className="text-slate-200" />
@@ -508,7 +552,7 @@ function MiddleColumn({
         </div>
       )}
 
-      <div className="flex max-h-[calc(100vh-20rem)] flex-1 flex-col rounded-lg border border-white/10 bg-slate-950/40">
+      <div className="flex max-h-[calc(100vh-32rem)] min-h-[8rem] flex-1 flex-col rounded-lg border border-white/10 bg-slate-950/40">
         <h3 className="flex items-center gap-1.5 border-b border-white/10 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-300">
           <ScrollText size={13} /> Event Log
         </h3>
@@ -526,6 +570,130 @@ function MiddleColumn({
         </ul>
       </div>
     </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* WorldBox-style world map: terrain grid + territory + capitals        */
+/* ------------------------------------------------------------------ */
+
+function WorldMap({
+  world,
+  mode,
+  terrainBrush,
+  onSetTerrainBrush,
+  onPaintTile,
+}: {
+  world: WorldState;
+  mode: Mode;
+  terrainBrush: TerrainType;
+  onSetTerrainBrush: (t: TerrainType) => void;
+  onPaintTile: (x: number, y: number, terrain: TerrainType) => void;
+}) {
+  const territory = useMemo(() => computeTerritory(world), [world]);
+  const nationById = useMemo(() => new Map(world.nations.map((n) => [n.id, n])), [world.nations]);
+  const capitalKeys = useMemo(
+    () => new Set(world.nations.map((n) => `${n.capital[0]},${n.capital[1]}`)),
+    [world.nations]
+  );
+
+  return (
+    <div className="rounded-lg border border-white/10 bg-slate-950/40">
+      <div className="flex items-center justify-between border-b border-white/10 px-3 py-2">
+        <h2 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-300">
+          <MapIcon size={13} /> World Map
+        </h2>
+        {mode === "god" && (
+          <span className="flex items-center gap-1 text-[10px] text-fuchsia-300">
+            <Paintbrush size={11} /> Click a tile to paint
+          </span>
+        )}
+      </div>
+
+      {mode === "god" && (
+        <div className="flex flex-wrap items-center gap-1.5 border-b border-white/10 bg-slate-900/40 px-3 py-2">
+          {TERRAIN_CYCLE.map((t) => (
+            <button
+              key={t}
+              onClick={() => onSetTerrainBrush(t)}
+              className={`flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px] font-semibold transition-colors ${
+                terrainBrush === t
+                  ? "border-fuchsia-500/60 bg-fuchsia-500/15 text-fuchsia-200"
+                  : "border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700"
+              }`}
+            >
+              <span
+                className="inline-block h-2.5 w-2.5 rounded-sm"
+                style={{ backgroundColor: TERRAIN_COLOR[t] }}
+              />
+              {t}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="p-3">
+        <div
+          className="mx-auto grid w-full max-w-[420px] gap-[1px] overflow-hidden rounded-md border border-black/40"
+          style={{ gridTemplateColumns: `repeat(${MAP_WIDTH}, 1fr)`, aspectRatio: `${MAP_WIDTH} / ${MAP_HEIGHT}` }}
+        >
+          {world.map.map((tile) => {
+            const key = `${tile.x},${tile.y}`;
+            const ownerId = territory.get(key);
+            const owner = ownerId !== undefined ? nationById.get(ownerId) : undefined;
+            const isCapital = capitalKeys.has(key);
+            return (
+              <button
+                key={key}
+                title={`(${tile.x}, ${tile.y}) ${tile.terrain}${owner ? ` — ${owner.name}` : ""}`}
+                onClick={() => mode === "god" && onPaintTile(tile.x, tile.y, terrainBrush)}
+                disabled={mode !== "god"}
+                className={`relative aspect-square ${mode === "god" ? "cursor-pointer hover:brightness-125" : "cursor-default"}`}
+                style={{ backgroundColor: TERRAIN_COLOR[tile.terrain] }}
+              >
+                {owner && (
+                  <span
+                    className="absolute inset-0"
+                    style={{ backgroundColor: owner.color, opacity: 0.35 }}
+                  />
+                )}
+                {isCapital && owner && (
+                  <span
+                    className="absolute inset-0 flex items-center justify-center"
+                    aria-hidden
+                  >
+                    <span
+                      className="h-[55%] w-[55%] rounded-full border border-white/70"
+                      style={{ backgroundColor: owner.color }}
+                    />
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-3 text-[10px] text-slate-400">
+          {world.nations.map((n) => (
+            <span key={n.id} className="flex items-center gap-1">
+              <span className="inline-block h-2 w-2 rounded-full" style={{ backgroundColor: n.color }} />
+              {n.name}
+            </span>
+          ))}
+          <span className="ml-auto flex items-center gap-2">
+            {(["Plains", "Forest", "Mountain", "Desert", "Water"] as TerrainType[]).map((t) => (
+              <span key={t} className="flex items-center gap-1">
+                <span
+                  className="inline-block h-2 w-2 rounded-sm"
+                  style={{ backgroundColor: TERRAIN_COLOR[t] }}
+                />
+                {t}
+              </span>
+            ))}
+          </span>
+        </div>
+      </div>
+    </div>
   );
 }
 

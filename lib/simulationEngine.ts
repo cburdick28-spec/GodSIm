@@ -109,6 +109,144 @@ export const TECH_ERAS: readonly TechEraDefinition[] = [
 ] as const;
 
 // ============================================================================
+// 1b. THE WORLD MAP (WorldBox-style tile grid)
+// ============================================================================
+
+export const MAP_WIDTH = 20;
+export const MAP_HEIGHT = 12;
+
+export type TerrainType = "Water" | "Plains" | "Forest" | "Mountain" | "Desert";
+
+/** The order a God Mode terrain brush cycles through / is offered in. */
+export const TERRAIN_CYCLE: readonly TerrainType[] = [
+  "Plains",
+  "Forest",
+  "Mountain",
+  "Desert",
+  "Water",
+] as const;
+
+export interface Tile {
+  x: number;
+  y: number;
+  terrain: TerrainType;
+}
+
+function tileIndex(x: number, y: number, width: number): number {
+  return y * width + x;
+}
+
+/** Rough terrain generator: a noisy water/land split smoothed one pass (so
+ * coastlines/lakes cluster instead of speckling), then land tiles roll a
+ * weighted biome. Deliberately simple — flavor terrain for the map view and
+ * a God Mode brush canvas, not a hydrology simulation. */
+function generateMap(width: number, height: number): Tile[] {
+  const rawWater = new Array(width * height)
+    .fill(false)
+    .map(() => Math.random() < 0.22);
+
+  const smoothedWater = rawWater.map((_, i) => {
+    const x = i % width;
+    const y = Math.floor(i / width);
+    let waterNeighbors = 0;
+    let total = 0;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        total++;
+        if (rawWater[tileIndex(nx, ny, width)]) waterNeighbors++;
+      }
+    }
+    return waterNeighbors / total > 0.45;
+  });
+
+  const tiles: Tile[] = [];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (smoothedWater[tileIndex(x, y, width)]) {
+        tiles.push({ x, y, terrain: "Water" });
+        continue;
+      }
+      const roll = Math.random();
+      let terrain: TerrainType = "Plains";
+      if (roll < 0.15) terrain = "Mountain";
+      else if (roll < 0.4) terrain = "Forest";
+      else if (roll < 0.55) terrain = "Desert";
+      tiles.push({ x, y, terrain });
+    }
+  }
+  return tiles;
+}
+
+/** Picks a land tile as far as possible from any already-placed capital, so
+ * founding nations don't spawn on top of one another. */
+function pickCapitalTile(tiles: Tile[], existing: readonly [number, number][]): [number, number] {
+  const land = tiles.filter((t) => t.terrain !== "Water");
+  const candidates = land.length ? land : tiles;
+  let best: Tile = candidates[0];
+  let bestScore = -Infinity;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const t = choice(candidates);
+    const minDist = existing.length
+      ? Math.min(...existing.map(([ex, ey]) => Math.hypot(t.x - ex, t.y - ey)))
+      : Infinity;
+    if (minDist > bestScore) {
+      bestScore = minDist;
+      best = t;
+    }
+  }
+  return [best.x, best.y];
+}
+
+/** How far (in tiles) a nation's territory reaches from its capital —
+ * grows with population, capped so it never swallows the whole map. */
+export function claimRadius(population: number): number {
+  return 2 + Math.min(6, Math.floor(population / 15_000));
+}
+
+/** Pure, on-demand territory lookup: which nation (if any) owns each land
+ * tile, by nearest capital within that nation's claim radius. Not stored on
+ * WorldState — it's derived from `nations` + `map` fresh whenever needed. */
+export function computeTerritory(state: WorldState): Map<string, number> {
+  const ownership = new Map<string, number>();
+  for (const tile of state.map) {
+    if (tile.terrain === "Water") continue;
+    let bestNationId: number | null = null;
+    let bestDist = Infinity;
+    for (const nation of state.nations) {
+      const [cx, cy] = nation.capital;
+      const dist = Math.hypot(tile.x - cx, tile.y - cy);
+      if (dist <= claimRadius(nation.population) && dist < bestDist) {
+        bestDist = dist;
+        bestNationId = nation.id;
+      }
+    }
+    if (bestNationId !== null) ownership.set(`${tile.x},${tile.y}`, bestNationId);
+  }
+  return ownership;
+}
+
+/** God Mode terrain brush — repaints a single tile. */
+export function paintTerrain(state: WorldState, x: number, y: number, terrain: TerrainType): WorldState {
+  let changed = false;
+  const map = state.map.map((t) => {
+    if (t.x === x && t.y === y && t.terrain !== terrain) {
+      changed = true;
+      return { ...t, terrain };
+    }
+    return t;
+  });
+  if (!changed) return state;
+  return {
+    ...state,
+    map,
+    eventLog: pushEvent(state.eventLog, state.day, "system", `The gods reshape the land at (${x}, ${y}) into ${terrain}.`),
+  };
+}
+
+// ============================================================================
 // 2. DATA SURFACE OBJECTS
 // ============================================================================
 
@@ -202,6 +340,8 @@ export interface Nation {
   market: MarketGood[];
   laws: Law[];
   activeCrisis: MarketCrisis | null;
+  /** Tile coordinates of this nation's capital on `WorldState.map`. */
+  capital: [number, number];
 }
 
 export interface EventLog {
@@ -217,6 +357,8 @@ export interface WorldState {
   nations: Nation[];
   eventLog: EventLog[];
   nextPersonId: number;
+  /** The WorldBox-style terrain grid; static apart from God Mode's brush. */
+  map: Tile[];
 }
 
 // ============================================================================
@@ -317,7 +459,7 @@ function makeLaws(): Law[] {
   ];
 }
 
-function makeNation(id: number, name: string, color: string): Nation {
+function makeNation(id: number, name: string, color: string, capital: [number, number]): Nation {
   return {
     id,
     name,
@@ -333,6 +475,7 @@ function makeNation(id: number, name: string, color: string): Nation {
     ],
     laws: makeLaws(),
     activeCrisis: null,
+    capital,
   };
 }
 
@@ -356,7 +499,15 @@ function makePerson(id: number, nationId: number): Person {
 }
 
 export function createInitialWorld(): WorldState {
-  const nations = NATION_NAMES.map((name, i) => makeNation(i + 1, name, NATION_COLORS[i]));
+  const map = generateMap(MAP_WIDTH, MAP_HEIGHT);
+
+  const capitals: [number, number][] = [];
+  const nations = NATION_NAMES.map((name, i) => {
+    const capital = pickCapitalTile(map, capitals);
+    capitals.push(capital);
+    return makeNation(i + 1, name, NATION_COLORS[i], capital);
+  });
+
   let nextPersonId = 1;
   const people: Person[] = [];
   for (const nation of nations) {
@@ -372,6 +523,7 @@ export function createInitialWorld(): WorldState {
     nations,
     eventLog: [{ day: 0, kind: "system", text: "The world stirs awake." }],
     nextPersonId,
+    map,
   };
 }
 
@@ -564,6 +716,7 @@ export function processSimulationTick(state: WorldState): WorldState {
     techEraIndex,
     people,
     nations: finalNations,
+    map: state.map,
     eventLog,
     nextPersonId: state.nextPersonId,
   };
@@ -697,7 +850,8 @@ type EngineAction =
   | { type: "ADJUST_POPULATION"; nationId: number; delta: number }
   | { type: "ADD_TREASURY"; nationId: number; amount: number }
   | { type: "TOGGLE_PERSON_TRAIT"; personId: number; trait: string }
-  | { type: "TOGGLE_LAW"; nationId: number; lawId: LawId };
+  | { type: "TOGGLE_LAW"; nationId: number; lawId: LawId }
+  | { type: "PAINT_TERRAIN"; x: number; y: number; terrain: TerrainType };
 
 function reducer(state: WorldState, action: EngineAction): WorldState {
   switch (action.type) {
@@ -717,6 +871,8 @@ function reducer(state: WorldState, action: EngineAction): WorldState {
       return togglePersonTrait(state, action.personId, action.trait);
     case "TOGGLE_LAW":
       return toggleLaw(state, action.nationId, action.lawId);
+    case "PAINT_TERRAIN":
+      return paintTerrain(state, action.x, action.y, action.terrain);
     default:
       return state;
   }
@@ -734,6 +890,7 @@ export interface UseSimulationEngineResult {
   addTreasuryAction: (nationId: number, amount: number) => void;
   togglePersonTraitAction: (personId: number, trait: string) => void;
   toggleLawAction: (nationId: number, lawId: LawId) => void;
+  paintTerrainAction: (x: number, y: number, terrain: TerrainType) => void;
 }
 
 /**
@@ -775,6 +932,10 @@ export function useSimulationEngine(): UseSimulationEngineResult {
     (nationId: number, lawId: LawId) => dispatch({ type: "TOGGLE_LAW", nationId, lawId }),
     []
   );
+  const paintTerrainAction = useCallback(
+    (x: number, y: number, terrain: TerrainType) => dispatch({ type: "PAINT_TERRAIN", x, y, terrain }),
+    []
+  );
 
   return {
     world,
@@ -787,5 +948,6 @@ export function useSimulationEngine(): UseSimulationEngineResult {
     addTreasuryAction,
     togglePersonTraitAction,
     toggleLawAction,
+    paintTerrainAction,
   };
 }
