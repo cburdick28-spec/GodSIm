@@ -1,16 +1,26 @@
 // lib/simulationEngine.ts
 //
-// Client-side civilization engine for GodSim — data layer + math only.
-// No external state library: `useSimulationEngine` below is a plain
-// React hook (useReducer + useEffect), so `app/page.tsx` can consume it
-// with nothing but native hooks.
+// Single source of truth for GodSim's simulation. Client-side, native React
+// hooks only (useReducer + useEffect) — no external state library.
 //
-// Note on scope vs. the literal spec: Person and Nation carry a couple of
-// fields beyond the ones explicitly listed (Person.nationId, a market
-// registry keyed to it) because the spec's own mechanics need them — a
-// "national technology score" and a "localized commodity market" only
-// make sense if citizens are linked to a nation. Flagged here rather than
-// silently expanded.
+// Three systems layered on top of the original Cosmic Age / Tech Era / XP
+// engine:
+//   1. Endless Sky economic crises (Famine, Hyper-Inflation, Bountiful
+//      Harvest, Gold Rush) that warp supply/basePrice for a run of ticks.
+//   2. A WorldBox-style God Mode brush panel: bulk population edits,
+//      treasury spawning, and per-citizen trait injection (Divine Blessing /
+//      Bubonic Plague).
+//   3. Ruler Mode legislation: Trade Tariffs, Conscription, and a Free
+//      Market Charter, each a toggleable law with a treasury cost and a
+//      permanent effect on the tick math while active.
+//
+// Scale note: `Nation.population` is an abstract economic bulk number (city
+// population, thousands+) — separate from `people`, the small set of named,
+// individually-simulated "notable citizens" whose job mix (Farmer/Scholar/
+// Merchant ratios) is used as the workforce ratio applied against the whole
+// population. That's what lets an individual citizen's job choice, XP, and
+// injected traits meaningfully move a nation's whole economy without every
+// one of thousands of citizens needing to be a simulated object.
 
 import { useCallback, useEffect, useReducer, useState } from "react";
 
@@ -20,20 +30,13 @@ import { useCallback, useEffect, useReducer, useState } from "react";
 
 export interface CosmicAge {
   name: string;
-  /** Tailwind color keyword used to theme the dashboard shell while this
-   * age is active (see COSMIC_AGE_THEME below for the actual classes). */
   colorTheme: "emerald" | "slate" | "rose" | "cyan";
   description: string;
-  /** Additive shift applied to every living citizen's computed mood. */
   moodModifier: number;
-  /** Multiplier on Farmer output feeding the Food supply pool. */
   cropEfficiency: number;
-  /** Multiplier on the per-tick chance of a random war declaration. */
   warChanceModifier: number;
 }
 
-/** Rotates automatically every 30 game days — purely a function of `day`,
- * never stored, so it can't drift out of sync with time itself. */
 export const COSMIC_AGES: readonly CosmicAge[] = [
   {
     name: "Age of Hope",
@@ -79,8 +82,6 @@ export function getCosmicAge(day: number): CosmicAge {
   return COSMIC_AGES[getCosmicAgeIndex(day)];
 }
 
-/** Tailwind classes per `colorTheme`, applied to the dashboard's ambient
- * background shell with a transition so shifts between ages animate. */
 export const COSMIC_AGE_THEME: Record<CosmicAge["colorTheme"], string> = {
   emerald: "from-emerald-950 via-slate-950 to-slate-950",
   slate: "from-slate-800 via-slate-950 to-slate-950",
@@ -94,19 +95,17 @@ export interface TechEraDefinition {
   minAverageTech: number;
 }
 
-/** Long-term, sequential, and permanent — the world only ever advances
- * forward through this list, gated on population + average national tech. */
 export const TECH_ERAS: readonly TechEraDefinition[] = [
   { name: "Stone Age", minPopulation: 0, minAverageTech: 0 },
-  { name: "Bronze Age", minPopulation: 15, minAverageTech: 15 },
-  { name: "Iron Age", minPopulation: 30, minAverageTech: 35 },
-  { name: "Classical Age", minPopulation: 50, minAverageTech: 60 },
-  { name: "Medieval Age", minPopulation: 75, minAverageTech: 90 },
-  { name: "Renaissance", minPopulation: 100, minAverageTech: 130 },
-  { name: "Industrial Age", minPopulation: 130, minAverageTech: 180 },
-  { name: "Modern Age", minPopulation: 160, minAverageTech: 240 },
-  { name: "Information Age", minPopulation: 200, minAverageTech: 320 },
-  { name: "Stellar Age", minPopulation: 250, minAverageTech: 420 },
+  { name: "Bronze Age", minPopulation: 8_000, minAverageTech: 15 },
+  { name: "Iron Age", minPopulation: 20_000, minAverageTech: 35 },
+  { name: "Classical Age", minPopulation: 40_000, minAverageTech: 60 },
+  { name: "Medieval Age", minPopulation: 70_000, minAverageTech: 90 },
+  { name: "Renaissance", minPopulation: 110_000, minAverageTech: 130 },
+  { name: "Industrial Age", minPopulation: 160_000, minAverageTech: 180 },
+  { name: "Modern Age", minPopulation: 220_000, minAverageTech: 240 },
+  { name: "Information Age", minPopulation: 300_000, minAverageTech: 320 },
+  { name: "Stellar Age", minPopulation: 400_000, minAverageTech: 420 },
 ] as const;
 
 // ============================================================================
@@ -126,6 +125,11 @@ export const TRAIT_POOL: readonly string[] = [
   "stoic",
 ] as const;
 
+/** God-injected special traits — deliberately not part of TRAIT_POOL, so the
+ * natural level-up trait roll can never hand these out on its own. */
+export const DIVINE_BLESSING_TRAIT = "Divine Blessing";
+export const BUBONIC_PLAGUE_TRAIT = "Bubonic Plague";
+
 export interface Person {
   id: number;
   name: string;
@@ -139,18 +143,49 @@ export interface Person {
   job: JobClass;
   wealth: number;
   traits: string[];
-  /** Not in the original field list — added because national tech/market
-   * mechanics need citizens linked to a nation. See file header. */
   nationId: number;
 }
 
+export type GoodName = "Food" | "Luxury";
+
 export interface MarketGood {
-  name: "Food";
+  name: GoodName;
   basePrice: number;
   price: number;
   delta: number;
   supply: number;
   demand: number;
+}
+
+export type CrisisType = "Famine" | "HyperInflation" | "BountifulHarvest" | "GoldRush";
+
+export interface MarketCrisis {
+  type: CrisisType;
+  ticksRemaining: number;
+}
+
+export const CRISIS_LABEL: Record<CrisisType, string> = {
+  Famine: "Famine",
+  HyperInflation: "Hyper-Inflation",
+  BountifulHarvest: "Bountiful Harvest",
+  GoldRush: "Gold Rush",
+};
+
+export const CRISIS_DESCRIPTION: Record<CrisisType, string> = {
+  Famine: "Food supply has collapsed — prices are spiking.",
+  HyperInflation: "Currency is losing value fast — every good costs more.",
+  BountifulHarvest: "An overflowing harvest is flooding the food market.",
+  GoldRush: "A vein of wealth has sent luxury demand — and treasury — soaring.",
+};
+
+export type LawId = "tradeTariffs" | "conscription" | "freeMarketCharter";
+
+export interface Law {
+  id: LawId;
+  name: string;
+  description: string;
+  cost: number;
+  active: boolean;
 }
 
 export interface Nation {
@@ -159,13 +194,19 @@ export interface Nation {
   color: string;
   treasury: number;
   technology: number;
+  /** Abstract economic population (thousands+) — see file header. */
+  population: number;
+  /** Rises only while Conscription is active; a standing-army proxy. */
+  militaryMight: number;
   atWarWith: number[];
   market: MarketGood[];
+  laws: Law[];
+  activeCrisis: MarketCrisis | null;
 }
 
 export interface EventLog {
   day: number;
-  kind: "death" | "levelup" | "war" | "miracle" | "birth" | "system";
+  kind: "death" | "levelup" | "war" | "miracle" | "birth" | "system" | "crisis" | "law";
   text: string;
 }
 
@@ -186,14 +227,50 @@ const HUNGER_DECAY = 3;
 const ENERGY_DECAY = 2;
 const XP_PER_TICK: Record<JobClass, number> = { Farmer: 8, Scholar: 12, Merchant: 10 };
 const TRAIT_UNLOCK_CHANCE_ON_LEVEL_UP = 0.25;
+const DIVINE_BLESSING_XP_MULTIPLIER = 2;
+const BUBONIC_PLAGUE_NEEDS_DECAY = 0.15; // slashes remaining hunger/energy by 15% every tick it's active
+
 const FOOD_BASE_PRICE = 4;
-const FOOD_OUTPUT_PER_FARMER = 1.4;
-const FOOD_DEMAND_PER_CAPITA = 0.9;
+const LUXURY_BASE_PRICE = 12;
+const FOOD_OUTPUT_PER_CAPITA = 0.02;
+const FOOD_DEMAND_PER_CAPITA = 0.012;
 const FOOD_SUPPLY_JITTER = 2;
-const TECH_PER_SCHOLAR = 0.6;
-const WEALTH_PER_MERCHANT = 2;
+const LUXURY_OUTPUT_PER_CAPITA = 0.01;
+const LUXURY_DEMAND_PER_CAPITA = 0.004;
+const LUXURY_SUPPLY_JITTER = 1;
+
+const TECH_PER_CAPITA = 0.0006;
+const WEALTH_PER_CAPITA = 0.006;
+const BASE_TAX_RATE = 0.1;
+const TREASURY_TAX_YIELD = 0.05;
+
+const BASE_GROWTH_RATE = 0.0015;
 const WAR_BASE_CHANCE = 0.01;
 const MAX_EVENT_LOG = 300;
+
+// --- Ruler Mode legislation --------------------------------------------------
+const TARIFF_FLAT_BONUS = 8;
+const TARIFF_LUXURY_PRICE_BONUS = 0.5; // +50% base price on Luxury
+const CONSCRIPTION_GROWTH_MULTIPLIER = 0.5;
+const MILITARY_MIGHT_GAIN_PER_TICK = 4;
+const FREE_MARKET_SCARCITY_MULTIPLIER = 2;
+const FREE_MARKET_TAX_BONUS = 0.25;
+
+export const LAW_COSTS: Record<LawId, number> = {
+  tradeTariffs: 150,
+  conscription: 200,
+  freeMarketCharter: 250,
+};
+
+// --- Economic crises ---------------------------------------------------------
+const CRISIS_TRIGGER_CHANCE = 0.012; // per nation, per tick, only while no crisis is active
+const CRISIS_DURATION_TICKS = 15;
+const CRISIS_TYPES: readonly CrisisType[] = ["Famine", "HyperInflation", "BountifulHarvest", "GoldRush"];
+const FAMINE_SUPPLY_MULTIPLIER = 0.2; // -80%
+const BOUNTIFUL_HARVEST_SUPPLY_MULTIPLIER = 2;
+const HYPER_INFLATION_PRICE_MULTIPLIER = 2;
+const GOLD_RUSH_DEMAND_MULTIPLIER = 1.5;
+const GOLD_RUSH_TREASURY_BONUS = 40;
 
 const NATION_NAMES = ["Aurelia", "Kaldor", "Vessin"];
 const NATION_COLORS = ["#f59e0b", "#38bdf8", "#a78bfa"];
@@ -214,17 +291,48 @@ const choice = <T,>(arr: readonly T[]): T => arr[Math.floor(Math.random() * arr.
 // world factory
 // ============================================================================
 
+function makeLaws(): Law[] {
+  return [
+    {
+      id: "tradeTariffs",
+      name: "Trade Tariffs",
+      description: "Luxury goods cost 50% more to trade; a flat cut of every tariff funnels straight into the treasury.",
+      cost: LAW_COSTS.tradeTariffs,
+      active: false,
+    },
+    {
+      id: "conscription",
+      name: "Conscription",
+      description: "Halves natural population growth, but raises a standing Military Might that grows every tick.",
+      cost: LAW_COSTS.conscription,
+      active: false,
+    },
+    {
+      id: "freeMarketCharter",
+      name: "Free Market Charter",
+      description: "Scarcity swings hit twice as hard in both directions; baseline tax revenue rises 25%.",
+      cost: LAW_COSTS.freeMarketCharter,
+      active: false,
+    },
+  ];
+}
+
 function makeNation(id: number, name: string, color: string): Nation {
   return {
     id,
     name,
     color,
-    treasury: 200,
+    treasury: 500,
     technology: 5,
+    population: 5_000,
+    militaryMight: 0,
     atWarWith: [],
     market: [
       { name: "Food", basePrice: FOOD_BASE_PRICE, price: FOOD_BASE_PRICE, delta: 0, supply: 100, demand: 100 },
+      { name: "Luxury", basePrice: LUXURY_BASE_PRICE, price: LUXURY_BASE_PRICE, delta: 0, supply: 50, demand: 50 },
     ],
+    laws: makeLaws(),
+    activeCrisis: null,
   };
 }
 
@@ -276,6 +384,10 @@ function pushEvent(log: EventLog[], day: number, kind: EventLog["kind"], text: s
   return next.length > MAX_EVENT_LOG ? next.slice(next.length - MAX_EVENT_LOG) : next;
 }
 
+function findLaw(nation: Nation, id: LawId): boolean {
+  return nation.laws.find((l) => l.id === id)?.active ?? false;
+}
+
 function computeMood(hunger: number, energy: number, cosmicMoodModifier: number): number {
   const base = hunger * 0.55 + energy * 0.45;
   return clamp(Math.round(base + cosmicMoodModifier), 0, 100);
@@ -288,12 +400,17 @@ export function processSimulationTick(state: WorldState): WorldState {
   const cosmicAge = getCosmicAge(day);
   let eventLog = state.eventLog;
 
-  // --- needs decay, XP/leveling, deaths ------------------------------------
+  // --- needs decay, XP/leveling, deaths, trait effects ---------------------
   const people = state.people.map((person) => {
     if (!person.alive) return person;
 
-    const hunger = clamp(person.hunger - HUNGER_DECAY, 0, 100);
-    const energy = clamp(person.energy - ENERGY_DECAY, 0, 100);
+    const plagued = person.traits.includes(BUBONIC_PLAGUE_TRAIT);
+    let hunger = clamp(person.hunger - HUNGER_DECAY, 0, 100);
+    let energy = clamp(person.energy - ENERGY_DECAY, 0, 100);
+    if (plagued) {
+      hunger = clamp(hunger * (1 - BUBONIC_PLAGUE_NEEDS_DECAY), 0, 100);
+      energy = clamp(energy * (1 - BUBONIC_PLAGUE_NEEDS_DECAY), 0, 100);
+    }
 
     if (hunger <= 0) {
       eventLog = pushEvent(eventLog, day, "death", `${person.name} has died of starvation.`);
@@ -303,8 +420,10 @@ export function processSimulationTick(state: WorldState): WorldState {
     const mood = computeMood(hunger, energy, cosmicAge.moodModifier);
 
     // Self-Improvement XP Engine: working citizens earn XP every tick.
+    // Divine Blessing doubles the rate at which a blessed citizen levels up.
     let { level, xp, traits } = person;
-    xp += XP_PER_TICK[person.job];
+    const blessed = traits.includes(DIVINE_BLESSING_TRAIT);
+    xp += XP_PER_TICK[person.job] * (blessed ? DIVINE_BLESSING_XP_MULTIPLIER : 1);
     const threshold = levelThreshold(level);
     if (xp >= threshold) {
       xp -= threshold;
@@ -323,37 +442,92 @@ export function processSimulationTick(state: WorldState): WorldState {
     return { ...person, hunger, energy, mood, level, xp, traits };
   });
 
-  const livingPopulation = people.filter((p) => p.alive).length;
-
-  // --- Endless Sky-style market + national economy --------------------------
+  // --- per-nation economy: workforce, legislation, crises, market ----------
   const nations = state.nations.map((nation) => {
     const citizens = people.filter((p) => p.nationId === nation.id && p.alive);
-    const farmers = citizens.filter((p) => p.job === "Farmer").length;
-    const scholars = citizens.filter((p) => p.job === "Scholar").length;
-    const merchants = citizens.filter((p) => p.job === "Merchant").length;
+    const total = citizens.length;
+    const farmerFrac = total ? citizens.filter((p) => p.job === "Farmer").length / total : 1 / 3;
+    const scholarFrac = total ? citizens.filter((p) => p.job === "Scholar").length / total : 1 / 3;
+    const merchantFrac = total ? citizens.filter((p) => p.job === "Merchant").length / total : 1 / 3;
 
-    const technology = nation.technology + scholars * TECH_PER_SCHOLAR;
-    const treasury = nation.treasury + merchants * WEALTH_PER_MERCHANT;
+    const tradeTariffsActive = findLaw(nation, "tradeTariffs");
+    const conscriptionActive = findLaw(nation, "conscription");
+    const freeMarketActive = findLaw(nation, "freeMarketCharter");
+
+    // population growth (Conscription halves it)
+    const growthRate = BASE_GROWTH_RATE * (conscriptionActive ? CONSCRIPTION_GROWTH_MULTIPLIER : 1);
+    const population = Math.max(0, Math.round(nation.population * (1 + growthRate)));
+
+    // Military Might rises only while Conscription is active.
+    const militaryMight = nation.militaryMight + (conscriptionActive ? MILITARY_MIGHT_GAIN_PER_TICK : 0);
+
+    // workforce output
+    const technology = nation.technology + population * scholarFrac * TECH_PER_CAPITA;
+    let treasury = nation.treasury + population * merchantFrac * WEALTH_PER_CAPITA;
+
+    // tax revenue (Free Market Charter: +25% baseline yield)
+    let taxRevenue = population * BASE_TAX_RATE * TREASURY_TAX_YIELD;
+    if (freeMarketActive) taxRevenue *= 1 + FREE_MARKET_TAX_BONUS;
+    treasury += taxRevenue;
+    if (tradeTariffsActive) treasury += TARIFF_FLAT_BONUS;
+
+    // --- economic crisis: tick down an active one, or roll for a new one ---
+    let activeCrisis = nation.activeCrisis;
+    if (activeCrisis) {
+      const ticksRemaining = activeCrisis.ticksRemaining - 1;
+      if (ticksRemaining <= 0) {
+        eventLog = pushEvent(eventLog, day, "crisis", `${CRISIS_LABEL[activeCrisis.type]} has passed in ${nation.name}.`);
+        activeCrisis = null;
+      } else {
+        activeCrisis = { ...activeCrisis, ticksRemaining };
+      }
+    } else if (Math.random() < CRISIS_TRIGGER_CHANCE) {
+      const type = choice(CRISIS_TYPES);
+      activeCrisis = { type, ticksRemaining: CRISIS_DURATION_TICKS };
+      eventLog = pushEvent(eventLog, day, "crisis", `${CRISIS_LABEL[type]} strikes ${nation.name}! ${CRISIS_DESCRIPTION[type]}`);
+    }
+    if (activeCrisis?.type === "GoldRush") treasury += GOLD_RUSH_TREASURY_BONUS;
+
+    // Free Market Charter doubles how hard scarcity swings hit price.
+    const scarcityMultiplier = freeMarketActive ? FREE_MARKET_SCARCITY_MULTIPLIER : 1;
+    // Hyper-Inflation doubles every good's effective base price for its duration.
+    const priceMultiplier = activeCrisis?.type === "HyperInflation" ? HYPER_INFLATION_PRICE_MULTIPLIER : 1;
 
     const market = nation.market.map((good) => {
-      const jitter = (Math.random() * 2 - 1) * FOOD_SUPPLY_JITTER;
-      const supply = Math.max(
-        0,
-        farmers * FOOD_OUTPUT_PER_FARMER * cosmicAge.cropEfficiency + jitter
-      );
-      const demand = Math.max(0, Math.round(citizens.length * FOOD_DEMAND_PER_CAPITA));
-      const rawPrice = good.basePrice * (demand / Math.max(1, supply));
+      let supply: number;
+      let demand: number;
+
+      if (good.name === "Food") {
+        const jitter = (Math.random() * 2 - 1) * FOOD_SUPPLY_JITTER;
+        supply = Math.max(0, population * farmerFrac * FOOD_OUTPUT_PER_CAPITA * cosmicAge.cropEfficiency + jitter);
+        if (activeCrisis?.type === "Famine") supply *= FAMINE_SUPPLY_MULTIPLIER;
+        if (activeCrisis?.type === "BountifulHarvest") supply *= BOUNTIFUL_HARVEST_SUPPLY_MULTIPLIER;
+        demand = Math.max(0, Math.round(population * FOOD_DEMAND_PER_CAPITA));
+      } else {
+        const jitter = (Math.random() * 2 - 1) * LUXURY_SUPPLY_JITTER;
+        supply = Math.max(0, population * merchantFrac * LUXURY_OUTPUT_PER_CAPITA + jitter);
+        demand = Math.max(0, Math.round(population * LUXURY_DEMAND_PER_CAPITA));
+        if (activeCrisis?.type === "GoldRush") demand *= GOLD_RUSH_DEMAND_MULTIPLIER;
+      }
+
+      let effectiveBasePrice = good.basePrice * priceMultiplier;
+      if (good.name === "Luxury" && tradeTariffsActive) effectiveBasePrice *= 1 + TARIFF_LUXURY_PRICE_BONUS;
+
+      const ratio = (demand / Math.max(1, supply)) * scarcityMultiplier;
+      const rawPrice = effectiveBasePrice * ratio;
       const price = clamp(Math.round(rawPrice * 100) / 100, 1, 100);
       const delta = Math.round((price - good.price) * 100) / 100;
+
       return { ...good, supply, demand, price, delta };
     });
 
-    return { ...nation, technology, treasury, market };
+    return { ...nation, population, militaryMight, technology, treasury, market, activeCrisis };
   });
+
+  const livingPopulation = nations.reduce((sum, n) => sum + n.population, 0);
 
   // --- Dynamic Aggression Events: cosmic-age-scaled random war declarations -
   let finalNations = nations;
-  let finalEventLog = eventLog;
   for (let i = 0; i < finalNations.length; i++) {
     for (let j = i + 1; j < finalNations.length; j++) {
       const a = finalNations[i];
@@ -365,7 +539,7 @@ export function processSimulationTick(state: WorldState): WorldState {
           if (n.id === b.id) return { ...n, atWarWith: [...n.atWarWith, a.id] };
           return n;
         });
-        finalEventLog = pushEvent(finalEventLog, day, "war", `${a.name} declared war on ${b.name}!`);
+        eventLog = pushEvent(eventLog, day, "war", `${a.name} declared war on ${b.name}!`);
       }
     }
   }
@@ -382,12 +556,7 @@ export function processSimulationTick(state: WorldState): WorldState {
     }
   });
   if (techEraIndex > state.techEraIndex) {
-    finalEventLog = pushEvent(
-      finalEventLog,
-      day,
-      "system",
-      `The world has advanced into the ${TECH_ERAS[techEraIndex].name}.`
-    );
+    eventLog = pushEvent(eventLog, day, "system", `The world has advanced into the ${TECH_ERAS[techEraIndex].name}.`);
   }
 
   return {
@@ -395,13 +564,13 @@ export function processSimulationTick(state: WorldState): WorldState {
     techEraIndex,
     people,
     nations: finalNations,
-    eventLog: finalEventLog,
+    eventLog,
     nextPersonId: state.nextPersonId,
   };
 }
 
 // ============================================================================
-// 4. God-mode actions (pure, same shape as processSimulationTick)
+// 4. God Mode actions (pure, same shape as processSimulationTick)
 // ============================================================================
 
 export function spawnCitizen(state: WorldState): WorldState {
@@ -433,6 +602,89 @@ export function castBlessing(state: WorldState): WorldState {
   };
 }
 
+/** Population Editor — "Set" button. Directly overwrites a nation's bulk
+ * population figure. */
+export function setPopulation(state: WorldState, nationId: number, population: number): WorldState {
+  const clamped = Math.max(0, Math.round(population));
+  return {
+    ...state,
+    nations: state.nations.map((n) => (n.id === nationId ? { ...n, population: clamped } : n)),
+  };
+}
+
+/** Population Editor — "+10k Pop" / "-10k Pop" quick-tap buttons. */
+export function adjustPopulation(state: WorldState, nationId: number, delta: number): WorldState {
+  return {
+    ...state,
+    nations: state.nations.map((n) =>
+      n.id === nationId ? { ...n, population: Math.max(0, Math.round(n.population + delta)) } : n
+    ),
+  };
+}
+
+/** Treasury Spawner — "Spawn 5,000 gp" button. */
+export function addTreasury(state: WorldState, nationId: number, amount: number): WorldState {
+  const nation = state.nations.find((n) => n.id === nationId);
+  return {
+    ...state,
+    nations: state.nations.map((n) => (n.id === nationId ? { ...n, treasury: n.treasury + amount } : n)),
+    eventLog: nation
+      ? pushEvent(state.eventLog, state.day, "miracle", `${amount.toLocaleString()} gp materialized in ${nation.name}'s treasury.`)
+      : state.eventLog,
+  };
+}
+
+/** Trait Injection System — toggles a special trait (Divine Blessing /
+ * Bubonic Plague, or any string) on a specific citizen's `traits` array. */
+export function togglePersonTrait(state: WorldState, personId: number, trait: string): WorldState {
+  const person = state.people.find((p) => p.id === personId);
+  if (!person) return state;
+  const has = person.traits.includes(trait);
+  const people = state.people.map((p) =>
+    p.id === personId
+      ? { ...p, traits: has ? p.traits.filter((t) => t !== trait) : [...p.traits, trait] }
+      : p
+  );
+  const text = has
+    ? `${person.name} is no longer touched by ${trait}.`
+    : `${trait} has been laid upon ${person.name}.`;
+  return {
+    ...state,
+    people,
+    eventLog: pushEvent(state.eventLog, state.day, "miracle", text),
+  };
+}
+
+/** Ruler Mode legislation toggle. Activating a law deducts its treasury
+ * cost up front; if the nation can't afford it, the state is returned
+ * unchanged. Repealing a law is free but non-refundable. */
+export function toggleLaw(state: WorldState, nationId: number, lawId: LawId): WorldState {
+  const nation = state.nations.find((n) => n.id === nationId);
+  if (!nation) return state;
+  const law = nation.laws.find((l) => l.id === lawId);
+  if (!law) return state;
+
+  if (!law.active && nation.treasury < law.cost) {
+    return state; // can't afford to pass it
+  }
+
+  const nextActive = !law.active;
+  const nations = state.nations.map((n) => {
+    if (n.id !== nationId) return n;
+    return {
+      ...n,
+      treasury: nextActive ? n.treasury - law.cost : n.treasury,
+      laws: n.laws.map((l) => (l.id === lawId ? { ...l, active: nextActive } : l)),
+    };
+  });
+
+  const text = nextActive
+    ? `${nation.name} passes ${law.name}.`
+    : `${nation.name} repeals ${law.name}.`;
+
+  return { ...state, nations, eventLog: pushEvent(state.eventLog, state.day, "law", text) };
+}
+
 // ============================================================================
 // React hook
 // ============================================================================
@@ -440,7 +692,12 @@ export function castBlessing(state: WorldState): WorldState {
 type EngineAction =
   | { type: "TICK" }
   | { type: "SPAWN_CITIZEN" }
-  | { type: "CAST_BLESSING" };
+  | { type: "CAST_BLESSING" }
+  | { type: "SET_POPULATION"; nationId: number; population: number }
+  | { type: "ADJUST_POPULATION"; nationId: number; delta: number }
+  | { type: "ADD_TREASURY"; nationId: number; amount: number }
+  | { type: "TOGGLE_PERSON_TRAIT"; personId: number; trait: string }
+  | { type: "TOGGLE_LAW"; nationId: number; lawId: LawId };
 
 function reducer(state: WorldState, action: EngineAction): WorldState {
   switch (action.type) {
@@ -450,6 +707,16 @@ function reducer(state: WorldState, action: EngineAction): WorldState {
       return spawnCitizen(state);
     case "CAST_BLESSING":
       return castBlessing(state);
+    case "SET_POPULATION":
+      return setPopulation(state, action.nationId, action.population);
+    case "ADJUST_POPULATION":
+      return adjustPopulation(state, action.nationId, action.delta);
+    case "ADD_TREASURY":
+      return addTreasury(state, action.nationId, action.amount);
+    case "TOGGLE_PERSON_TRAIT":
+      return togglePersonTrait(state, action.personId, action.trait);
+    case "TOGGLE_LAW":
+      return toggleLaw(state, action.nationId, action.lawId);
     default:
       return state;
   }
@@ -459,8 +726,14 @@ export interface UseSimulationEngineResult {
   world: WorldState;
   isRunning: boolean;
   setRunning: (running: boolean) => void;
+
   spawnCitizenAction: () => void;
   castBlessingAction: () => void;
+  setPopulationAction: (nationId: number, population: number) => void;
+  adjustPopulationAction: (nationId: number, delta: number) => void;
+  addTreasuryAction: (nationId: number, amount: number) => void;
+  togglePersonTraitAction: (personId: number, trait: string) => void;
+  toggleLawAction: (nationId: number, lawId: LawId) => void;
 }
 
 /**
@@ -482,6 +755,37 @@ export function useSimulationEngine(): UseSimulationEngineResult {
 
   const spawnCitizenAction = useCallback(() => dispatch({ type: "SPAWN_CITIZEN" }), []);
   const castBlessingAction = useCallback(() => dispatch({ type: "CAST_BLESSING" }), []);
+  const setPopulationAction = useCallback(
+    (nationId: number, population: number) => dispatch({ type: "SET_POPULATION", nationId, population }),
+    []
+  );
+  const adjustPopulationAction = useCallback(
+    (nationId: number, delta: number) => dispatch({ type: "ADJUST_POPULATION", nationId, delta }),
+    []
+  );
+  const addTreasuryAction = useCallback(
+    (nationId: number, amount: number) => dispatch({ type: "ADD_TREASURY", nationId, amount }),
+    []
+  );
+  const togglePersonTraitAction = useCallback(
+    (personId: number, trait: string) => dispatch({ type: "TOGGLE_PERSON_TRAIT", personId, trait }),
+    []
+  );
+  const toggleLawAction = useCallback(
+    (nationId: number, lawId: LawId) => dispatch({ type: "TOGGLE_LAW", nationId, lawId }),
+    []
+  );
 
-  return { world, isRunning, setRunning: setIsRunning, spawnCitizenAction, castBlessingAction };
+  return {
+    world,
+    isRunning,
+    setRunning: setIsRunning,
+    spawnCitizenAction,
+    castBlessingAction,
+    setPopulationAction,
+    adjustPopulationAction,
+    addTreasuryAction,
+    togglePersonTraitAction,
+    toggleLawAction,
+  };
 }
