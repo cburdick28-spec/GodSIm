@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "godsim",
+  "project_id": "82166a04-cf1f-4880-8064-52156e67c5e6"
+}
