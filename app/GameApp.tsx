@@ -185,6 +185,7 @@ export default function GameApp() {
           terrainBrush={terrainBrush}
           onSetTerrainBrush={setTerrainBrush}
           onPaintTile={paintTerrainAction}
+          onSelectNation={setSelectedNationId}
         />
 
         <RightColumn
@@ -503,6 +504,7 @@ function MiddleColumn({
   terrainBrush,
   onSetTerrainBrush,
   onPaintTile,
+  onSelectNation,
 }: {
   world: WorldState;
   cosmicAge: ReturnType<typeof getCosmicAge>;
@@ -514,6 +516,7 @@ function MiddleColumn({
   terrainBrush: TerrainType;
   onSetTerrainBrush: (t: TerrainType) => void;
   onPaintTile: (x: number, y: number, terrain: TerrainType) => void;
+  onSelectNation: (nationId: number) => void;
 }) {
   const recentEvents = useMemo(() => eventLog.slice(-60).reverse(), [eventLog]);
 
@@ -522,9 +525,11 @@ function MiddleColumn({
       <WorldMap
         world={world}
         mode={mode}
+        cosmicAge={cosmicAge}
         terrainBrush={terrainBrush}
         onSetTerrainBrush={onSetTerrainBrush}
         onPaintTile={onPaintTile}
+        onSelectNation={onSelectNation}
       />
 
       <div className="rounded-lg border border-white/10 bg-white/5 p-4">
@@ -589,15 +594,19 @@ function MiddleColumn({
 function WorldMap({
   world,
   mode,
+  cosmicAge,
   terrainBrush,
   onSetTerrainBrush,
   onPaintTile,
+  onSelectNation,
 }: {
   world: WorldState;
   mode: Mode;
+  cosmicAge: ReturnType<typeof getCosmicAge>;
   terrainBrush: TerrainType;
   onSetTerrainBrush: (t: TerrainType) => void;
   onPaintTile: (x: number, y: number, terrain: TerrainType) => void;
+  onSelectNation: (nationId: number) => void;
 }) {
   return (
     <div className="rounded-lg border border-white/10 bg-slate-950/40">
@@ -605,9 +614,13 @@ function WorldMap({
         <h2 className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-300">
           <MapIcon size={13} /> World Map (3D)
         </h2>
-        {mode === "god" && (
+        {mode === "god" ? (
           <span className="flex items-center gap-1 text-[10px] text-fuchsia-300">
             <Paintbrush size={11} /> Click a tile to paint
+          </span>
+        ) : (
+          <span className="flex items-center gap-1 text-[10px] text-amber-300">
+            Click a tile to inspect its nation
           </span>
         )}
       </div>
@@ -635,7 +648,14 @@ function WorldMap({
       )}
 
       <div className="p-3">
-        <WorldMap3D world={world} mode={mode} terrainBrush={terrainBrush} onPaintTile={onPaintTile} />
+        <WorldMap3D
+          world={world}
+          mode={mode}
+          cosmicAge={cosmicAge}
+          terrainBrush={terrainBrush}
+          onPaintTile={onPaintTile}
+          onSelectNation={onSelectNation}
+        />
 
         <div className="mt-3 flex flex-wrap items-center gap-3 text-[10px] text-slate-400">
           {world.nations.map((n) => (
@@ -645,7 +665,7 @@ function WorldMap({
             </span>
           ))}
           <span className="ml-auto flex items-center gap-2">
-            {(["Plains", "Forest", "Mountain", "Desert", "Water"] as TerrainType[]).map((t) => (
+            {(["Plains", "Hills", "Forest", "Mountain", "Desert", "Water"] as TerrainType[]).map((t) => (
               <span key={t} className="flex items-center gap-1">
                 <span
                   className="inline-block h-2 w-2 rounded-sm"

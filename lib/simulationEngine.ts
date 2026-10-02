@@ -112,14 +112,15 @@ export const TECH_ERAS: readonly TechEraDefinition[] = [
 // 1b. THE WORLD MAP (WorldBox-style tile grid)
 // ============================================================================
 
-export const MAP_WIDTH = 20;
-export const MAP_HEIGHT = 12;
+export const MAP_WIDTH = 30;
+export const MAP_HEIGHT = 18;
 
-export type TerrainType = "Water" | "Plains" | "Forest" | "Mountain" | "Desert";
+export type TerrainType = "Water" | "Plains" | "Hills" | "Forest" | "Mountain" | "Desert";
 
 /** The order a God Mode terrain brush cycles through / is offered in. */
 export const TERRAIN_CYCLE: readonly TerrainType[] = [
   "Plains",
+  "Hills",
   "Forest",
   "Mountain",
   "Desert",
@@ -136,45 +137,85 @@ function tileIndex(x: number, y: number, width: number): number {
   return y * width + x;
 }
 
-/** Rough terrain generator: a noisy water/land split smoothed one pass (so
- * coastlines/lakes cluster instead of speckling), then land tiles roll a
- * weighted biome. Deliberately simple — flavor terrain for the map view and
- * a God Mode brush canvas, not a hydrology simulation. */
-function generateMap(width: number, height: number): Tile[] {
-  const rawWater = new Array(width * height)
-    .fill(false)
-    .map(() => Math.random() < 0.22);
+/** Relative frequency of each land biome when scattering region seeds —
+ * bigger weight means that biome tends to claim more of the map. */
+const BIOME_WEIGHT: Record<Exclude<TerrainType, "Water">, number> = {
+  Plains: 0.34,
+  Forest: 0.24,
+  Hills: 0.16,
+  Desert: 0.15,
+  Mountain: 0.11,
+};
 
-  const smoothedWater = rawWater.map((_, i) => {
-    const x = i % width;
-    const y = Math.floor(i / width);
-    let waterNeighbors = 0;
-    let total = 0;
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        const nx = x + dx;
-        const ny = y + dy;
-        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-        total++;
-        if (rawWater[tileIndex(nx, ny, width)]) waterNeighbors++;
+/** Terrain generator: a two-pass cellular-automata water mask (so coastlines
+ * and lakes cluster into believable shapes instead of speckling), then land
+ * biomes are grown from scattered weighted seed points rather than rolled
+ * per-tile — nearest-seed assignment (with a touch of jitter so the borders
+ * aren't razor-straight Voronoi lines) produces large, natural-looking
+ * contiguous regions instead of salt-and-pepper noise. Deliberately simple —
+ * flavor terrain for the map view and a God Mode brush canvas, not a real
+ * hydrology/climate simulation. */
+function generateMap(width: number, height: number): Tile[] {
+  let water = new Array(width * height).fill(false).map(() => Math.random() < 0.32);
+
+  // Two smoothing passes: coastlines/lakes cluster instead of speckling.
+  for (let pass = 0; pass < 2; pass++) {
+    water = water.map((_, i) => {
+      const x = i % width;
+      const y = Math.floor(i / width);
+      let waterNeighbors = 0;
+      let total = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          total++;
+          if (water[tileIndex(nx, ny, width)]) waterNeighbors++;
+        }
       }
+      return waterNeighbors / total > 0.45;
+    });
+  }
+
+  const landCoords: Array<[number, number]> = [];
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!water[tileIndex(x, y, width)]) landCoords.push([x, y]);
     }
-    return waterNeighbors / total > 0.45;
-  });
+  }
+
+  // Scatter a handful of biome "region seeds" across the land, weighted so
+  // bigger-weight biomes get more seeds (and therefore more territory).
+  const biomeTypes = Object.keys(BIOME_WEIGHT) as Array<Exclude<TerrainType, "Water">>;
+  const totalSeeds = Math.max(biomeTypes.length, Math.round((width * height) / 42));
+  const seeds: Array<{ x: number; y: number; biome: TerrainType }> = [];
+  for (const biome of biomeTypes) {
+    const count = Math.max(1, Math.round(totalSeeds * BIOME_WEIGHT[biome]));
+    for (let i = 0; i < count; i++) {
+      const [x, y] = landCoords.length ? choice(landCoords) : [0, 0];
+      seeds.push({ x, y, biome });
+    }
+  }
 
   const tiles: Tile[] = [];
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      if (smoothedWater[tileIndex(x, y, width)]) {
+      if (water[tileIndex(x, y, width)]) {
         tiles.push({ x, y, terrain: "Water" });
         continue;
       }
-      const roll = Math.random();
-      let terrain: TerrainType = "Plains";
-      if (roll < 0.15) terrain = "Mountain";
-      else if (roll < 0.4) terrain = "Forest";
-      else if (roll < 0.55) terrain = "Desert";
-      tiles.push({ x, y, terrain });
+      let best = seeds[0]?.biome ?? "Plains";
+      let bestDist = Infinity;
+      for (const seed of seeds) {
+        // Jitter keeps region borders organic instead of crisp Voronoi lines.
+        const dist = Math.hypot(x - seed.x, y - seed.y) + (Math.random() - 0.5) * 1.6;
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = seed.biome;
+        }
+      }
+      tiles.push({ x, y, terrain: best });
     }
   }
   return tiles;
